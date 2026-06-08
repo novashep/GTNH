@@ -5,20 +5,27 @@ local gpu = component.gpu
 local config = require("config")
 
 -- =================== HARDWARE INTERFACE ===================
-local me = component.me_controller
-local pumps = {}
-local running = true
-local currentMode = "Normal"
+local me = component.me_controller -- Proxy to ME Controller for querying fluid inventory
+local pumps = {} -- Array of active pump objects (auto-populated by findPumps)
+local running = true -- Main loop gate (set false to exit gracefully)
+local currentMode = "Normal" -- Sorting algorithm for pump assignment (Normal/Stairstep/Waterfall)
 
 -- Persistent Data Storage
-local fluidDeltas = {} 
-local lastSnapshot = {}      
-local lastSnapshotTime = 0   
-local snapshotInterval = 30  
-local totalThroughput = 0 -- Production tracking
+local fluidDeltas = {} -- Percentage change per fluid since last snapshot (used for "TOP GROWTH" display)
+local lastSnapshot = {} -- Previous fluid amounts (baseline for delta calculation)
+local lastSnapshotTime = 0 -- Timestamp of last delta calculation
+local snapshotInterval = 30 -- Ticks between delta recalculations (default 30 = ~1.5s)
+local totalThroughput = 0 -- Net liters gained in last snapshot (raw production metric)
 
+-- Scans OpenComputers component network for GT machines with specific pump tier names.
+-- Assigns multipliers (4x/16x/256x) and thread counts based on tier.
+-- Sorts by capacity (largest first) to assign high-demand fluids to powerful pumps.
 local function findPumps()
   pumps = {}
+  -- Maps pump module names to tier specifications.
+  -- threads: Number of parallel extraction threads per pump (T1=1, T2=4, T3=4)
+  -- mult: Flow rate multiplier applied to base Wiki rate (T1=4x, T2=16x, T3=256x)
+  -- If using modded pumps, add entries here with custom multipliers.
   local tierLogic = {
     ["projectmodulepumpt1"] = {threads=1, mult=4,   label="T1"},
     ["projectmodulepumpt2"] = {threads=4, mult=16,  label="T2"},
@@ -55,6 +62,9 @@ local function formatFluid(amount)
   return string.format('%.2f %sL', value, suffixes[index])
 end
 
+-- Returns the storage limit for fluid filling (in liters).
+-- If maxTargetOverride is set, use it (for testing at custom scales).
+-- Otherwise, calculate from selected cell capacity minus safety margin.
 local function getTarget()
   if config.maxTargetOverride and config.maxTargetOverride > 0 then
     return config.maxTargetOverride
@@ -63,6 +73,10 @@ local function getTarget()
   return cap * (1 - config.safetyMargin)
 end
 
+-- Syncs ME network state with config.master table.
+-- Calculates deltas every snapshotInterval ticks (tracks production rate).
+-- Sorts fluid list by demand mode (which fluids pumps should prioritize).
+-- Returns list sorted by current mode: Normal prioritizes shortages, Stairstep uses tiers, Waterfall focuses on single item.
 local function updateFluids(target)
   local list = {}
   local currentTime = os.time()
@@ -98,7 +112,10 @@ local function updateFluids(target)
     })
   end
 
-  -- Needs-First Sorting
+  -- Needs-First Sorting by mode
+  -- Normal: Pump anything below 100%, prioritize by configured priority, then by lowest amount. Good for balanced filling.
+  -- Stairstep: Aggressive tiers (<10% critical, 10-50% moderate, 50%+ maintenance). Faster recovery from empty.
+  -- Waterfall: All pumps focus on lowest-stocked item until full, then cascade to next. Sequential, orderly approach.
   if currentMode == "Normal" or currentMode == "Waterfall" then
     table.sort(list, function(a, b)
       local aNeeds = a.perc < 100 and 1 or 0
@@ -119,6 +136,10 @@ local function updateFluids(target)
 end
 
 -- =================== UI RENDERING ===================
+-- Renders real-time dashboard on large monitor (supports 4K+).
+-- Sections: pump status (activity + current task), fluid demand (% full + absolute amount), and deltas (growth/reduction trends).
+-- Colors indicate urgency: red (<50%), orange (50-95%), green (95-110%), magenta (>110%, overflow safe).
+-- Throughput metric shows net liters gained in last 30 ticks across all fluids (production KPI).
 local function drawUI(target, allFluids)
   term.clear()
   local w, h = gpu.getResolution()
@@ -191,6 +212,9 @@ local function drawUI(target, allFluids)
 end
 
 -- =================== EXECUTION ===================
+-- Ensures all pumps are idle before main loop starts (safety check).
+-- Prevents race conditions where pumps finish/restart during initialization.
+-- 5-second delay gives ME Controller time to sync inventory after module reset.
 local function preLaunch()
   term.clear()
   findPumps()
@@ -221,6 +245,10 @@ while running do
   local allFluids = updateFluids(target)
   local lowFluids = {}
   for _, f in ipairs(allFluids) do if f.amount < target then table.insert(lowFluids, f) end end
+  -- Each tick, checks idle pumps and assigns next fluid from demand queue.
+  -- Sets planet/slot parameters based on fluid.setting from config.
+  -- Waterfall mode ignores pump index; other modes assign queue[index] to pump[index].
+  -- Work gate (setWorkAllowed) momentarily enables pump to execute task, then disables (prevents runaway).
   for i, p in ipairs(pumps) do
     if not p.module.isMachineActive() then
       local fluid = (currentMode == "Waterfall") and lowFluids[1] or (lowFluids[i] or lowFluids[1])
@@ -232,6 +260,11 @@ while running do
   end
   drawUI(target, allFluids)
   local _, _, char = event.pull(1, "key_down")
+  -- Keyboard controls:
+  -- [N]: Switch to Normal mode (balanced prioritization)
+  -- [S]: Switch to Stairstep mode (aggressive tiers)
+  -- [W]: Switch to Waterfall mode (single-focus cascade)
+  -- [Q]: Quit (gracefully stops main loop and exits script)
   if char == 110 then currentMode = "Normal"
   elseif char == 115 then currentMode = "Stairstep"
   elseif char == 119 then currentMode = "Waterfall"

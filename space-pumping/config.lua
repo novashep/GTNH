@@ -1,11 +1,15 @@
 local config = {}
 
--- Network & UI Settings
-config.currentCellType = "16384k" 
-config.safetyMargin = 0.20        
+-- ===================== CORE CONFIGURATION ===================
+-- currentCellType: ME fluid cell size in use (options: 1k, 4k, 16k, 64k, 256k, 1024k, 4096k, 16384k, Quantum)
+-- safetyMargin: Fraction of cell capacity to reserve (e.g., 0.20 = stop at 80% full to prevent overflow)
+-- maxTargetOverride: Set to 0 to auto-calculate from cell capacity; non-zero value forces a static target (useful for testing)
+config.currentCellType = "16384k"
+config.safetyMargin = 0.20
 config.maxTargetOverride = 1000000000 -- set to 1G liters for testing 
 
--- ME Fluid Cell Capacities (in Liters)
+-- ME Fluid Cell Capacities (in Liters). Calculated from AE2 ME fluid cell specs.
+-- Use these to determine storage limits and pump target percentages.
 config.CELL_CAPACITIES = {
     ["1k"]      = 2080000,      -- 2.08M Liters
     ["4k"]      = 8320000,      -- 8.32M Liters
@@ -19,8 +23,14 @@ config.CELL_CAPACITIES = {
 }
 
 -- ===================== FLUID MASTER LIST ===================
--- Rates are (Wiki L/s) / 20 to get Liters per tick.
--- Multipliers (4x, 16x, 256x) are applied in the main script.
+-- Rates are extracted from GTNH Wiki (listed as L/s).
+-- Divide Wiki value by 20 to convert to liters per tick (OC clock runs at 20 Hz).
+-- Final throughput = rate * pump_multiplier * thread_count (multipliers: T1=4x, T2=16x, T3=256x applied in main script)
+--
+-- priority: Controls fill order (0-5, higher = pump sooner). Use 4-5 for critical/endgame materials.
+-- amount: Automatically populated by main script; stores current fluid quantity in ME network.
+-- setting: {planet_number, output_slot} coordinates on space station. Match your base layout.
+-- rate: Liters per second (from Wiki) ÷ 20. Represents extraction rate per pump thread per tick.
 
 config.master = {
   -- Planet 2
