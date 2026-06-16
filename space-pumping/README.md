@@ -4,35 +4,35 @@ An OpenComputers automation script for GTNH (GregTech New Horizons) that manages
 
 ## Overview
 
-This system uses GT Project Module pumps (T1, T2, T3) with Internet Cards to extract gases and fluids from GTNH space stations. The main script (`autoPump-LargeScreen.lua`) orchestrates pump operations based on configurable demand, while `config.lua` defines fluid sources, extraction rates, and storage targets.
+This OpenComputers script controls Space Pumping Modules in any tier (T1, T2, T3) to extract gases and fluids from planets automatically switching between the different spaces and fluids. The main script (`autoPump-LargeScreen.lua`) orchestrates pump operations based on configurable demand, while `config.lua` defines fluid sources, extraction rates, and storage targets.
 
 **Features:**
-- **Multi-planet fluid extraction** from 7 planets with 40+ unique fluids
+- **Multi-planet fluid extraction** from 7 planets with 40 unique fluids
 - **Intelligent prioritization** using 3 sorting modes (Normal, Stairstep, Waterfall)
 - **Real-time analytics**: throughput tracking, delta monitoring, demand percentages
 - **Pump tier detection**: Automatically identifies T1 (1x), T2 (16x), and T3 (256x) pumps
 - **Configurable storage targets**: Based on ME fluid cell capacities with safety margins
-- **Large display support**: Multi-column layout for 4K monitors
+- **Large display support**: Supports a matrix of 6 T3 Screens (2 high-3 wide)
 
 ## Hardware Requirements
 
 ### Minimum Setup
 - **OpenComputers computer** (case, CPU, RAM, hard drive)
 - **ME Controller** with interface to network
-- **Internet Card** (1 per pump module, for wireless communication)
+- **Internet Card** (to download via wget the script from here on GitHub)
 - **1x Space Pumping Module T1** minimum
 - **Graphics Card T3**
 - **Adapters mapped to each Space Pumping Module and ME Controller for Fluid Subnet**  
 
 ### Optimal Setup
-- **Computer with T3 CPU or T3 APU** (faster scheduling)
-- **2x Tier 3.5 Memory Cards** (handles 40+ fluid states smoothly)
+- **Computer with T3 CPU or T3 APU**
+- **2x Tier 3.5 Memory Cards**
 - **Multiple pump tiers** (T1 + T2 + T3 for max flexibility)
-- **Large Monitor** (4K recommended for full dashboard)
+- **T3 Screen** 
 
 ## Installation
 
-1. **Copy scripts to OpenComputers hard drive:**
+1. **Copy scripts to OpenComputers hard drive using wget:**
    ```
    /space-pumping/config.lua
    /space-pumping/autoPump-LargeScreen.lua
@@ -41,6 +41,7 @@ This system uses GT Project Module pumps (T1, T2, T3) with Internet Cards to ext
 2. **Configure your setup** in `config.lua`:
    - Update `currentCellType` to match your ME fluid storage cells
    - Adjust `safetyMargin` (0.20 = 20% buffer before cell full)
+   - If you aren't testing, make sure to set the config.maxTargetOverride value to 0
    - Rates already calculated based on Wiki (pre-configured values / 20 to convert to L/tick)
 
 3. **Run the script:**
@@ -142,14 +143,11 @@ TARGET: 27.28 GL
 
 ### Pumps Won't Start
 - Check ME Controller address in logs (should auto-detect)
-- Verify Internet Cards are in pumps and powered
+- Ensure they're connected to the adapter
+- Is the Space Elevator powered?
+- Do you have enough computation for the module?
 - Ensure planet/slot settings match actual space station layout
 - Run `findPumps()` debug function to list detected modules
-
-### Rates Too Slow/Fast
-- Verify rates in `config.master` (base rates, before multiplier)
-- Check Wiki for latest extraction rates (may change per GTNH version)
-- T1: ×4, T2: ×16, T3: ×256 are the hard-coded multipliers
 
 ### Storage Filling Unexpectedly
 - Lower `safetyMargin` (e.g., 0.10 for 10% buffer)
@@ -160,6 +158,9 @@ TARGET: 27.28 GL
 - Reduce monitor resolution if possible
 - Disable color formatting (edit `drawUI()`)
 - Increase `snapshotInterval` (line 17, default 30 = 30 ticks)
+
+### Changing config.lua values don't take effect
+- Reboot the Space Pumping computer, sometimes values don't take effect until reboot.
 
 ## Architecture
 
