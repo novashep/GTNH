@@ -14,7 +14,7 @@ local currentMode = "Normal" -- Sorting algorithm for pump assignment (Normal/St
 local fluidDeltas = {} -- Percentage change per fluid since last snapshot (used for "TOP GROWTH" display)
 local lastSnapshot = {} -- Previous fluid amounts (baseline for delta calculation)
 local lastSnapshotTime = 0 -- Timestamp of last delta calculation
-local snapshotInterval = 30 -- Ticks between delta recalculations (default 30 = ~1.5s)
+local snapshotInterval = 120 -- Ticks between delta recalculations (120 = ~6s for smoother, less noisy metrics)
 local totalThroughput = 0 -- Net liters gained in last snapshot (raw production metric)
 
 -- Scans OpenComputers component network for GT machines with specific pump tier names.
@@ -163,13 +163,15 @@ local function drawUI(target, allFluids)
     gpu.set(col + 24, row, string.format("| %-20s | %s", p.task, tput))
   end
 
-  -- Demand Queue
+  -- Demand Queue - displays all fluids in 3-column layout
   gpu.set(1, 12, "║ FLUID DEMAND QUEUE")
   gpu.set(1, 13, string.rep("─", w))
   for i, f in ipairs(allFluids) do
-    if i > 30 then break end
-    local x = (math.floor((i-1) / 10) * math.floor(w/3)) + 2
-    local y = 14 + ((i-1) % 10)
+    if i > 40 then break end -- Display all 40 configured fluids
+    local col = math.floor((i-1) / 14) -- 3 columns
+    local row = 14 + ((i-1) % 14) -- 14 rows per column
+    local x = col * math.floor(w/3) + 2
+    local y = row
     if f.perc < 50 then gpu.setForeground(0xFF6666)
     elseif f.perc < 95 then gpu.setForeground(0xFFCC33)
     elseif f.perc < 110 then gpu.setForeground(0x00FF00)
