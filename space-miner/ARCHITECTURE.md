@@ -114,7 +114,7 @@ MEDINA (Modular Extraction and Dispatch Intelligence Network Array) is a wireles
 **Supporting modules (on the same computer):**
 - `scheduler.lua` — cooperative task engine (spawn / sleep / await / lock; one clock via `computer.uptime`)
 - `loader.lua` — per-module load sequence, run as a task; read-back confirmation + identity-based item routing
-- `loki_logger.lua` — INFO/ERROR logging to Grafana Loki
+- `logger.lua` — configurable logging (file / console / Loki); disabled by default, ERROR/WARN to `/tmp/spacemining.log`
 
 **Network:**
 - **Inbound (Port 2026):** telemetry from dust_telem / hw_telem / fluid_telem

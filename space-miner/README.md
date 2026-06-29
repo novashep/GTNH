@@ -2,7 +2,7 @@
 
 Automated wireless mining system for the GTNH Space Elevator. Monitors dust storage levels across your ME network, selects asteroids to target by priority, and loads consumables to drive up to 6 Mining Modules in parallel — all from a single consolidated **Broker MK3** computer.
 
-**Current version: v1.5 (Broker MK3).** A cooperative task scheduler loads all 6 modules concurrently without blocking, achieving ~10× the throughput of the earlier blocking design. Telemetry monitoring nodes are optional; the broker can also read its own hardware directly.
+**Current version: v1.5 (Broker MK3).** A cooperative task scheduler loads all 6 modules concurrently without blocking, achieving ~10× the throughput of the earlier blocking design. The broker dispatches based on telemetry from **three required monitor nodes** — dust (what to mine), hardware (drones/drill kits), and fluid (plasma). It won't start mining until all three report, because mining modules physically require a plasma fluid to operate.
 
 ---
 
@@ -13,7 +13,7 @@ Automated wireless mining system for the GTNH Space Elevator. Monitors dust stor
   dust_telem  ──────────►│   BROKER MK3  (port 2026 in)    │
   fluid_telem ──────────►│                                 │
   hw_telem    ──────────►│   cooperative scheduler:        │──► M1 ┐
-   (optional telem)      │   • dispatch (drone-first)      │──► M2 │ up to 6
+  (dust+hw required)     │   • dispatch (drone-first)      │──► M2 │ up to 6
                          │   • 6 concurrent load tasks     │──► M3 │ Mining
                          │   • read-back item confirmation │──► M4 │ Modules
                          │   • 3×2 T3 screen dashboard     │──► M5 │ (local)
@@ -29,13 +29,13 @@ Each module has its own ME Interface adapter + transposer; one shared OC Databas
 | File | Runs on | Purpose |
 |------|---------|---------|
 | `config.lua` | *all nodes* | Master config — drones, drills, asteroids, plasmas, optimization matrix, dust targets and thresholds. Copy to `/home/config.lua` on every computer. |
-| `broker-mk3.lua` | broker | **The broker.** Aggregates telemetry, dispatches jobs (drone-first with a per-asteroid cap), and spawns one cooperative load task per module. Requires `/home/job_node_config.lua`, `/home/scheduler.lua`, `/home/loader.lua`, `/home/loki_logger.lua`. |
+| `broker-mk3.lua` | broker | **The broker.** Aggregates telemetry, dispatches jobs (drone-first with a per-asteroid cap), and spawns one cooperative load task per module. Requires `/home/job_node_config.lua`, `/home/scheduler.lua`, `/home/loader.lua`, `/home/logger.lua`. |
 | `scheduler.lua` | broker | Cooperative task engine: `spawn`, `sleep`, `await`, fair `lock`. One clock (`computer.uptime`). Lets all 6 loads run concurrently without freezing the UI/telemetry. You never edit this to add features — you spawn a task. |
 | `loader.lua` | broker | One module's consumable-load sequence, run as a scheduler task. Confirms database fingerprints by read-back and routes items into the input bus by identity (not slot position). |
-| `loki_logger.lua` | broker | Posts INFO/ERROR logs to Grafana Loki with uptime-anchored timestamps. |
-| `dust_telem.lua` | dust node *(optional)* | Queries the dust-storage ME subnet every 120 s; broadcasts tracked item stocks to the broker. |
-| `fluid_telem.lua` | fluid node *(optional)* | Queries the plasma ME fluid network every 10 s; broadcasts all five plasma volumes. |
-| `hw_telem.lua` | hw node *(optional)* | Scans the hardware-staging ME network every 10 s for drone counts and drill kit pairs; broadcasts a keyed inventory summary. |
+| `logger.lua` | broker | Logging with a configurable backend (file / console / Loki). Disabled by default — ERROR/WARN still written to `/tmp/spacemining.log`. Configure under `config.logging`. |
+| `dust_telem.lua` | dust node **(required)** | Queries the dust-storage ME subnet every 120 s; broadcasts tracked item stocks to the broker. Broker won't dispatch without it. |
+| `hw_telem.lua` | hw node **(required)** | Scans the hardware-staging ME network every 10 s for drone counts and drill kit pairs. Broker won't dispatch without it. |
+| `fluid_telem.lua` | fluid node **(required)** | Queries the plasma ME fluid network every 10 s; broadcasts plasma volumes. Modules need plasma to run, so the broker won't dispatch without it. |
 | `job_node.lua` | remote worker *(optional)* | Legacy remote worker for additional modules on a separate computer. Retained for future multi-node fleets; not required for the single-broker setup. |
 
 ---
@@ -59,7 +59,7 @@ Each module has its own ME Interface adapter + transposer; one shared OC Databas
 
 **Throughput:** all 6 modules load in ~1–2 s each and mine in parallel. Measured ~9.4× the earlier blocking design (≈100k → ≈938k Infinity Catalyst dust/hr), confirmed stable over a 12-hour soak test.
 
-**Logging:** INFO/ERROR to Grafana Loki via `loki_logger.lua`. Each load reports read-back poll counts (`confirm polls d=N t=N r=N, arrive=N`); consistently low counts indicate `store()` is reliable on this setup. The UI also shows a per-module `loaded Xs db:N buf:N` diagnostic.
+**Logging:** via `logger.lua`, configured under `config.logging` (default off; ERROR/WARN still written to `/tmp/spacemining.log`). Backends: `file` (default), `console`, or `loki` if you run Grafana Loki. Each load reports read-back poll counts (`confirm polls d=N t=N r=N, arrive=N`); consistently low counts indicate `store()` is reliable on your setup. The UI also shows a per-module `loaded Xs db:N buf:N` diagnostic.
 
 **Stopping the broker:** break the script in the OC console with **Ctrl+Alt+C**.
 
@@ -277,16 +277,23 @@ RUNNING amber · LOADING yellow · ERROR red · IDLE dim.
 
 Copy `config.lua` to `/home/config.lua` on **every** computer in the system.
 
-### 2. Telemetry nodes (optional)
+### 2. Telemetry nodes
+
+**All three telem nodes are required** — dust (`dust_telem.lua`), hardware
+(`hw_telem.lua`), and fluid/plasma (`fluid_telem.lua`). The broker stays at
+"Waiting for telemetry..." and dispatches nothing until all three report. (Plasma
+is required because mining modules physically can't run without a plasma fluid.)
 
 Each telem node needs only its own script and `config.lua`:
 
 ```
 /home/config.lua
-/home/dust_telem.lua    (or fluid_telem.lua / hw_telem.lua)
+/home/dust_telem.lua    (or hw_telem.lua / fluid_telem.lua)
 ```
 
-Set `targetSide` at the top of each script to the side of the OC Adapter facing your ME Controller. Boot and leave running.
+Set `targetSide` at the top of each script to the side of the OC Adapter facing
+the relevant ME Controller (dust node → dust-storage network; hardware node →
+the network holding your drones/drill bits). Boot and leave running.
 
 ### 3. Broker MK3 (primary deployment)
 
@@ -298,13 +305,14 @@ Copy these to the broker computer:
 /home/broker-mk3.lua
 /home/scheduler.lua
 /home/loader.lua
-/home/loki_logger.lua
+/home/logger.lua
 ```
 
 **First boot:**
-1. Fill in `job_node_config.lua` with each module's hardware:
+1. Copy `job_node_config.example.lua` to `/home/job_node_config.lua` and fill in your hardware:
    - `dbAddr` — the shared OC Database (3 slots used per module)
    - per module: `tier`, `moduleAddr` (module controller adapter), `ifaceAddr` (ME interface adapter), `transposerAddr`, `interfaceSide`, `inputBusSide`
+   - Find addresses with `list_components.lua`, or add modules with `detect_module.lua`.
 2. Run `broker-mk3.lua`. It prompts for **priority mode** (Threshold / Rarity), then draws the dashboard and begins dispatching once telemetry arrives.
 
 To stop it, break the script with **Ctrl+Alt+C** in the OC console.
