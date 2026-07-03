@@ -1,5 +1,5 @@
 -- =============================================================================
--- MEDINA LOADER  (v1.5)
+-- MEDINA LOADER  (v2.0 — GTNH 2.9 compatible)
 -- Loads one mining module's consumables (drone + drill tip + drill rod) from the
 -- ME network into its input bus. Designed to run as a scheduler TASK, so six of
 -- these can be in flight at once without freezing the broker.
@@ -10,31 +10,21 @@
 --   - ONE shared database component holds item fingerprints, partitioned by slot:
 --     M1 -> 1/2/3, M2 -> 4/5/6, ...  Slots never overlap between modules.
 --
--- THE KEY INSIGHT (replaces the old magic-sleep guesswork):
---   The database is passive reference storage. iface.store() writes a fingerprint
---   into a slot, but the write may not be visible the instant store() returns.
---   So instead of sleeping a fixed guess and praying, we READ THE SLOT BACK with
---   db.get() and proceed the moment the fingerprint is confirmed. Self-pacing:
---   instant when the server is fast, patient when it lags.
---
--- DIAGNOSTICS:
---   Each load records how many poll iterations the read-back took. If it's almost
---   always 0-1, store() is reliable on this setup. If it's regularly higher,
---   store() returns early and the read-back is what's keeping us correct. Either
---   way the first in-world run tells us the truth.
+-- GTNH 2.9 FIX:
+--   iface.store() is broken in 2.9 — it returns true but writes nothing.
+--   We now use db.set(slot, registryName, damage) which writes fingerprints
+--   directly and synchronously. Registry names come from config.droneRegistry
+--   and config.drillRegistry (populated via scan_items.lua).
 -- =============================================================================
 
-local component = require("component")
-local sched     = dofile("/home/scheduler.lua")
+local component       = require("component")
+local sched           = dofile("/home/scheduler.lua")
 
-local loader = {}
+local loader          = {}
 
 -- Tunables (all in real seconds, all honest — no tick/second mixing).
-local CONFIRM_TIMEOUT = 8     -- max wait for a fingerprint to appear in the db
-local ARRIVE_TIMEOUT  = 8     -- max wait for items to arrive in interface buffer
-local POLL_INTERVAL   = 0.1   -- how often to re-check while awaiting
-local TIPS_PER        = 64    -- drill tips to stock
-local RODS_PER        = 64    -- drill rods to stock
+local ARRIVE_TIMEOUT  = 15  -- max wait for items to arrive in interface buffer
+local POLL_INTERVAL   = 0.2 -- how often to re-check while awaiting
 
 -- Map a module index to its three dedicated database slots.
 local function dbSlotsFor(modIndex)
@@ -55,13 +45,19 @@ local function pollUntil(predicate, timeout)
   return met, iterations
 end
 
--- Confirm a fingerprint actually landed in a db slot by reading it back.
--- This is the spine of the v1.5 fix.
-local function confirmFingerprint(db, slot, expectedLabel)
-  return pollUntil(function()
-    local stack = db.get(slot)
-    return stack ~= nil and stack.label == expectedLabel
-  end, CONFIRM_TIMEOUT)
+-- Write a fingerprint into a db slot using the GTNH 2.9 db.set() API.
+-- Returns true if the fingerprint was written and verified, false + error otherwise.
+local function writeFingerprint(db, slot, regName, regDamage)
+  local ok = db.set(slot, regName, regDamage)
+  if not ok then
+    return false, "db.set returned false for slot " .. slot .. " (" .. regName .. ":" .. regDamage .. ")"
+  end
+  -- Verify it landed (synchronous, but check anyway for safety)
+  local stack = db.get(slot)
+  if not stack then
+    return false, "db.get returned nil after db.set for slot " .. slot
+  end
+  return true
 end
 
 -- Clear the input bus back into the ME interface buffer (recover stale items).
@@ -95,16 +91,23 @@ end
 --   ok=false -> error string
 -- ---------------------------------------------------------------------------
 function loader.run(mod, job, deps)
-  local config = deps.config
-  local logger = deps.logger
-  local db     = deps.db
-  local dbAddr = deps.dbAddr
+  local config     = deps.config
+  local logger     = deps.logger
+  local db         = deps.db
+  local dbAddr     = deps.dbAddr
+
+  local TIPS_PER   = config.tipsPerLoad or 64
+  local RODS_PER   = config.rodsPerLoad or 64
 
   local droneName  = config.drones[job.droneKey]
   local drillEntry = config.drills[job.drillKey]
+  local droneReg   = config.droneRegistry[job.droneKey]
+  local drillReg   = config.drillRegistry[job.drillKey]
 
-  if not droneName  then return false, "bad droneKey: " .. tostring(job.droneKey) end
+  if not droneName then return false, "bad droneKey: " .. tostring(job.droneKey) end
   if not drillEntry then return false, "bad drillKey: " .. tostring(job.drillKey) end
+  if not droneReg then return false, "no droneRegistry for: " .. tostring(job.droneKey) end
+  if not drillReg then return false, "no drillRegistry for: " .. tostring(job.drillKey) end
 
   local slotDrone, slotTip, slotRod = dbSlotsFor(mod.index)
   local stats = { confirmPolls = {}, arrivePolls = 0 }
@@ -133,22 +136,17 @@ function loader.run(mod, job, deps)
     return false, "interface buffer did not drain before load (stale items stuck)"
   end
 
-  -- 2. Write fingerprints, confirming each by read-back before moving on.
+  -- 2. Write fingerprints using db.set (GTNH 2.9 fix — store() is broken).
   local items = {
-    { slot = slotDrone, label = droneName,       tag = "drone" },
-    { slot = slotTip,   label = drillEntry.tip,  tag = "tip"   },
-    { slot = slotRod,   label = drillEntry.rod,  tag = "rod"   },
+    { slot = slotDrone, regName = droneReg.name, regDmg = droneReg.damage, tag = "drone" },
+    { slot = slotTip,   regName = drillReg.tip.name, regDmg = drillReg.tip.damage, tag = "tip" },
+    { slot = slotRod,   regName = drillReg.rod.name, regDmg = drillReg.rod.damage, tag = "rod" },
   }
 
   for _, it in ipairs(items) do
-    local ok = mod.iface.store({ label = it.label }, dbAddr, it.slot)
-    -- store()'s return is treated as a hint; the read-back is the truth.
-    local confirmed, polls = confirmFingerprint(db, it.slot, it.label)
-    stats.confirmPolls[it.tag] = polls
-    if not confirmed then
-      return false, "fingerprint never confirmed for " .. it.tag ..
-                    " (" .. it.label .. ") in slot " .. it.slot ..
-                    "; store() returned " .. tostring(ok)
+    local ok, err = writeFingerprint(db, it.slot, it.regName, it.regDmg)
+    if not ok then
+      return false, "fingerprint write failed for " .. it.tag .. ": " .. err
     end
   end
 
@@ -174,16 +172,16 @@ function loader.run(mod, job, deps)
 
   local arrived, polls = pollUntil(function()
     return bufferHas(droneName, 1)
-       and bufferHas(drillEntry.tip, TIPS_PER)
-       and bufferHas(drillEntry.rod, RODS_PER)
+        and bufferHas(drillEntry.tip, TIPS_PER)
+        and bufferHas(drillEntry.rod, RODS_PER)
   end, ARRIVE_TIMEOUT)
   stats.arrivePolls = polls
 
   if not arrived then
     clearInterfaceSlots(mod)
     return false, "items did not arrive: drone=" .. tostring(bufferHas(droneName, 1)) ..
-                  " tip=" .. tostring(bufferHas(drillEntry.tip, TIPS_PER)) ..
-                  " rod=" .. tostring(bufferHas(drillEntry.rod, RODS_PER))
+        " tip=" .. tostring(bufferHas(drillEntry.tip, TIPS_PER)) ..
+        " rod=" .. tostring(bufferHas(drillEntry.rod, RODS_PER))
   end
 
   -- 5. Move items into the input bus by IDENTITY, not by slot position.
@@ -222,9 +220,15 @@ function loader.run(mod, job, deps)
   end
 
   local okMove, moveErr
-  okMove, moveErr = moveByIdentity(droneName,      1,        1, "drone"); if not okMove then clearInterfaceSlots(mod); return false, moveErr end
-  okMove, moveErr = moveByIdentity(drillEntry.tip, TIPS_PER, 2, "tip");   if not okMove then clearInterfaceSlots(mod); return false, moveErr end
-  okMove, moveErr = moveByIdentity(drillEntry.rod, RODS_PER, 3, "rod");   if not okMove then clearInterfaceSlots(mod); return false, moveErr end
+  okMove, moveErr = moveByIdentity(droneName, 1, 1, "drone"); if not okMove then
+    clearInterfaceSlots(mod); return false, moveErr
+  end
+  okMove, moveErr = moveByIdentity(drillEntry.tip, TIPS_PER, 2, "tip"); if not okMove then
+    clearInterfaceSlots(mod); return false, moveErr
+  end
+  okMove, moveErr = moveByIdentity(drillEntry.rod, RODS_PER, 3, "rod"); if not okMove then
+    clearInterfaceSlots(mod); return false, moveErr
+  end
 
   clearInterfaceSlots(mod)
   sched.sleep(0.2)
@@ -236,7 +240,7 @@ function loader.run(mod, job, deps)
 
   if not droneStack or droneStack.label ~= droneName then
     return false, "drone mismatch in bus: expected " .. droneName ..
-                  ", got " .. (droneStack and droneStack.label or "empty")
+        ", got " .. (droneStack and droneStack.label or "empty")
   end
   if not tipStack or (tipStack.size or 0) < TIPS_PER then
     return false, "tip shortfall: got " .. (tipStack and tipStack.size or 0)
@@ -248,6 +252,6 @@ function loader.run(mod, job, deps)
   return true, stats
 end
 
-loader.dbSlotsFor = dbSlotsFor  -- exported for the broker's UI/return logic
+loader.dbSlotsFor = dbSlotsFor -- exported for the broker's UI/return logic
 
 return loader

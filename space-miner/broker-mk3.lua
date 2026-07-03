@@ -21,16 +21,16 @@
 --           /home/job_node_config.lua, /home/config.lua, /home/logger.lua
 -- =============================================================================
 
-local component = require("component")
-local serial    = require("serialization")
-local event     = require("event")
-local term      = require("term")
-local fs        = require("filesystem")
-local computer  = require("computer")
+local component     = require("component")
+local serial        = require("serialization")
+local event         = require("event")
+local term          = require("term")
+local fs            = require("filesystem")
+local computer      = require("computer")
 
-local config = dofile("/home/config.lua")
-local sched  = dofile("/home/scheduler.lua")
-local loader = dofile("/home/loader.lua")
+local config        = dofile("/home/config.lua")
+local sched         = dofile("/home/scheduler.lua")
+local loader        = dofile("/home/loader.lua")
 
 local loggingModule = dofile("/home/logger.lua")
 assert(loggingModule and loggingModule.createLogger, "logger.lua not loaded")
@@ -40,8 +40,15 @@ local getUnixTime = loggingModule.getCurrentTimestamp
 logger:info("========== BROKER-MK3 (v1.5) STARTUP ==========")
 
 -- Surface task crashes in the log instead of swallowing them.
+-- CRITICAL: also set loadResult so the module doesn't get stuck in LOADING forever.
 sched.onError = function(name, err)
   logger:error("[TASK] " .. tostring(name) .. " crashed: " .. tostring(err))
+  -- Find the module whose load task just crashed and mark it failed.
+  for _, mod in ipairs(modules) do
+    if mod.status == "LOADING" and not mod.loadResult then
+      mod.loadResult = { ok = false, err = "task crashed: " .. tostring(err) }
+    end
+  end
 end
 
 -- =============================================================================
@@ -87,14 +94,14 @@ for i, mc in ipairs(nodeConf.modules) do
     index      = i,
     tier       = mc.tier,
     conf       = mc,
-    adapter    = getProxy(mc.moduleAddr,     lbl .. " moduleAddr"),
-    iface      = getProxy(mc.ifaceAddr,      lbl .. " ifaceAddr"),
+    adapter    = getProxy(mc.moduleAddr, lbl .. " moduleAddr"),
+    iface      = getProxy(mc.ifaceAddr, lbl .. " ifaceAddr"),
     transposer = getProxy(mc.transposerAddr, lbl .. " transposerAddr"),
-    status     = "IDLE",  -- IDLE | LOADING | RUNNING | DONE | ERROR
+    status     = "IDLE", -- IDLE | LOADING | RUNNING | DONE | ERROR
     job        = nil,
     doneTime   = nil,
-    loadHandle = nil,     -- scheduler task handle while LOADING
-    loadResult = nil,     -- set by the load task: { ok=bool, err=?, stats=? }
+    loadHandle = nil, -- scheduler task handle while LOADING
+    loadResult = nil, -- set by the load task: { ok=bool, err=?, stats=? }
   }
 end
 
@@ -106,24 +113,34 @@ end
 -- =============================================================================
 
 local brokerState = {
-  dust = {}, plasma = {}, drones = {}, drills = {}, jobs = {}, cooldowns = {},
-  lastDustSyncTime = 0, lastFluidSyncTime = 0, lastHWSyncTime = 0,
-  lastDustSync = "--:--:--", lastFluidSync = "--:--:--", lastHWSync = "--:--:--",
-  nextTarget = nil, telemetryReady = false,
-  priorityMode = "threshold",  -- "threshold" (lowest fill first) | "rarity" (dust priority first)
+  dust = {},
+  plasma = {},
+  drones = {},
+  drills = {},
+  jobs = {},
+  cooldowns = {},
+  lastDustSyncTime = 0,
+  lastFluidSyncTime = 0,
+  lastHWSyncTime = 0,
+  lastDustSync = "--:--:--",
+  lastFluidSync = "--:--:--",
+  lastHWSync = "--:--:--",
+  nextTarget = nil,
+  telemetryReady = false,
+  priorityMode = "threshold", -- "threshold" (lowest fill first) | "rarity" (dust priority first)
 }
 
 local drillKeyOrder = {
-  "steel","titanium","tungstensteel","naquadah",
-  "naquadahAlloy","neutronium","cosmicNeutronium","infinity","transcendentMetal"
+  "steel", "titanium", "tungstensteel", "naquadah",
+  "naquadahAlloy", "neutronium", "cosmicNeutronium", "infinity", "transcendentMetal"
 }
 
 for _, cond in ipairs(config.conditions) do
-  brokerState.dust[cond.itemName] = { stock=0, threshold=cond.amountToMaintain }
+  brokerState.dust[cond.itemName] = { stock = 0, threshold = cond.amountToMaintain }
 end
 for _, name in ipairs(config.plasmaKeyOrder) do brokerState.plasma[name] = 0 end
 for _, key in ipairs(config.droneKeyOrder) do brokerState.drones[key] = 0 end
-for _, key in ipairs(drillKeyOrder) do brokerState.drills[key] = { kits=0, tips=0, rods=0 } end
+for _, key in ipairs(drillKeyOrder) do brokerState.drills[key] = { kits = 0, tips = 0, rods = 0 } end
 
 -- UI layout (three panels).
 local W, H = gpu and gpu.maxResolution() or 120, 50
@@ -170,19 +187,26 @@ end
 -- every other module's load AND with the UI/telemetry loop.
 local function beginLoad(mod)
   mod.loadResult = nil
-  mod.loadStart = computer.uptime()  -- real seconds, for elapsed readout
+  mod.loadStart = computer.uptime() -- real seconds, for elapsed readout
   mod.loadHandle = sched.spawn(function()
-    local ok, errOrStats = loader.run(mod, mod.job, {
-      config = config, logger = logger, db = db, dbAddr = dbAddr,
-    })
-    mod.loadResult = ok and { ok = true, stats = errOrStats }
-                        or  { ok = false, err = errOrStats }
+    local success, ok, errOrStats = xpcall(function()
+      return loader.run(mod, mod.job, {
+        config = config, logger = logger, db = db, dbAddr = dbAddr,
+      })
+    end, debug.traceback)
+    if not success then
+      -- loader.run threw an error (ok contains the error message here)
+      mod.loadResult = { ok = false, err = "CRASH: " .. tostring(ok) }
+    else
+      mod.loadResult = ok and { ok = true, stats = errOrStats }
+          or { ok = false, err = errOrStats }
+    end
   end, "load-M" .. mod.index)
 end
 
 -- Called each frame for a LOADING module: check whether its task finished.
 local function pollLoad(mod)
-  if not mod.loadResult then return end  -- still loading
+  if not mod.loadResult then return end -- still loading
 
   local r = mod.loadResult
   mod.loadHandle = nil
@@ -205,10 +229,14 @@ local function pollLoad(mod)
       tostring(s.arrivePolls)))
     mod.status = "RUNNING"
     mod.job.startTime = os.time()
-    mod.adapter.setParameters(mod.conf.distanceParam, 0, mod.job.distance)
+    -- GTNH 2.9: set all required named parameters before enabling.
+    mod.adapter.setParameter("distance", mod.job.distance)
+    mod.adapter.setParameter("parallel", mod.job.parallels or 1)
+    mod.adapter.setParameter("cycle", false)
     mod.adapter.setWorkAllowed(true)
   else
     mod.status = "ERROR"
+    mod.lastError = tostring(r.err)
     logger:error("[LOAD] M" .. mod.index .. " failed: " .. tostring(r.err))
   end
 end
@@ -239,9 +267,12 @@ end
 
 local function stepModules()
   for _, mod in ipairs(modules) do
-    if     mod.status == "LOADING" then pollLoad(mod)
-    elseif mod.status == "RUNNING" then stepRunning(mod)
-    elseif mod.status == "DONE"    then stepDone(mod)
+    if mod.status == "LOADING" then
+      pollLoad(mod)
+    elseif mod.status == "RUNNING" then
+      stepRunning(mod)
+    elseif mod.status == "DONE" then
+      stepDone(mod)
     end
   end
 end
@@ -269,7 +300,7 @@ local function findNeedsList()
       local entry = config.dustTargets[cond.itemName]
       local ast = entry and entry.asteroid
       if ast and config.asteroids[ast] then
-        needs[#needs+1] = { itemName=cond.itemName, asteroid=ast, ratio=ratio, priority=entry.priority or 99 }
+        needs[#needs + 1] = { itemName = cond.itemName, asteroid = ast, ratio = ratio, priority = entry.priority or 99 }
       end
     end
   end
@@ -291,7 +322,7 @@ local function getIdleModules()
   local now = os.time()
   for i, mod in ipairs(modules) do
     if mod.status == "IDLE" then
-      idle[#idle+1] = mod
+      idle[#idle + 1] = mod
     elseif mod.status == "ERROR" then
       if not lastErrorTime[i] then
         lastErrorTime[i] = now
@@ -300,7 +331,7 @@ local function getIdleModules()
         mod.status = "IDLE"; mod.job = nil; mod.doneTime = nil
         lastErrorTime[i] = nil
         logger:info("[RECOVERY] M" .. i .. " auto-recovered from ERROR state")
-        idle[#idle+1] = mod
+        idle[#idle + 1] = mod
       end
     end
   end
@@ -318,16 +349,19 @@ local function tryDispatch(mod, asteroid, droneKey)
   local drillKey = config.droneDrillMap[droneTier]
   if not drillKey then return false end
 
-  -- Don't dispatch if we have no drill kit for this drone tier — otherwise the
-  -- load would just fail at the store() step waiting for tips/rods that aren't
-  -- in the ME network.
+  -- Don't dispatch if we don't have enough drill kits for a full load.
+  -- The loader needs config.tipsPerLoad tips + config.rodsPerLoad rods per module.
   local drill = brokerState.drills[drillKey]
-  if not drill or (drill.kits or 0) <= 0 then return false end
+  local minKits = math.max(config.tipsPerLoad or 64, config.rodsPerLoad or 64)
+  if not drill or (drill.kits or 0) < minKits then return false end
 
   local jobId = nodeId .. "-" .. os.time() .. "-M" .. mod.index
   mod.status = "LOADING"
   mod.job = {
-    jobId = jobId, asteroid = asteroid, droneKey = droneKey, drillKey = drillKey,
+    jobId = jobId,
+    asteroid = asteroid,
+    droneKey = droneKey,
+    drillKey = drillKey,
     distance = getOptimalDistance(mod.tier, asteroid, droneKey),
     parallels = config.moduleTiers[mod.tier].maxParallels,
     startTime = os.time(),
@@ -335,7 +369,7 @@ local function tryDispatch(mod, asteroid, droneKey)
   brokerState.jobs[jobId] = { moduleIndex = mod.index, asteroid = asteroid, startTime = os.time() }
   brokerState.nextTarget = { asteroid = asteroid, reason = "dispatched" }
 
-  beginLoad(mod)  -- non-blocking: spawns the cooperative load task
+  beginLoad(mod) -- non-blocking: spawns the cooperative load task
   return true
 end
 
@@ -376,7 +410,7 @@ end
 -- it stays correct if this broker grows back into a multi-job-node fleet (up to
 -- 24 modules across multiple space elevators, like v1.0).
 local function asteroidCap()
-  return math.floor(#modules / 2) + 1   -- 6 modules -> 4, 24 -> 13
+  return math.floor(#modules / 2) + 1 -- 6 modules -> 4, 24 -> 13
 end
 
 -- Count modules currently committed (loading/running) to each asteroid.
@@ -416,25 +450,27 @@ local function dispatchBatch()
   for _, need in ipairs(needs) do neededAsteroids[need.asteroid] = need end
 
   -- Working pools we can still hand out this batch: drones and drill kits.
-  local avail     = availableDrones()
-  local availKit  = availableKits()
+  local avail    = availableDrones()
+  local availKit = availableKits()
 
   -- Per-asteroid usage: start from what's already committed, count up as we go,
   -- and never exceed the cap. This is what frees module slots for lower-tier
   -- needs (e.g. Uranium-Plutonium) instead of one asteroid eating them all.
-  local cap        = asteroidCap()
-  local astCount   = activeAsteroidCounts()
+  local cap      = asteroidCap()
+  local astCount = activeAsteroidCounts()
+
+  local minKitsForLoad = math.max(config.tipsPerLoad or 64, config.rodsPerLoad or 64)
 
   for _, droneKey in ipairs(config.droneKeyOrder) do
     if (avail[droneKey] or 0) > 0 then
       local droneTier = config.droneTierKeys[droneKey]
       local drillKey  = config.droneDrillMap[droneTier]
 
-      -- Need both a free drone AND a free kit of the matching material.
-      if drillKey and (availKit[drillKey] or 0) > 0 then
+      -- Need both a free drone AND enough kits for a full load.
+      if drillKey and (availKit[drillKey] or 0) >= minKitsForLoad then
         for asteroidName, asteroidData in pairs(config.asteroids) do
           -- Stop scanning once we've exhausted this drone or its kits.
-          if (avail[droneKey] or 0) <= 0 or (availKit[drillKey] or 0) <= 0 then break end
+          if (avail[droneKey] or 0) <= 0 or (availKit[drillKey] or 0) < minKitsForLoad then break end
           if droneTier >= asteroidData.minDrone and droneTier <= asteroidData.maxDrone then
             -- Eligible if it's a current need AND under its module cap.
             if neededAsteroids[asteroidName] and (astCount[asteroidName] or 0) < cap then
@@ -443,8 +479,8 @@ local function dispatchBatch()
                 local mod = idleModules[idx]
                 if tryDispatch(mod, asteroidName, droneKey) then
                   astCount[asteroidName] = (astCount[asteroidName] or 0) + 1
-                  avail[droneKey]        = avail[droneKey] - 1     -- consume a drone
-                  availKit[drillKey]     = availKit[drillKey] - 1  -- consume a kit
+                  avail[droneKey]        = avail[droneKey] - 1              -- consume a drone
+                  availKit[drillKey]     = availKit[drillKey] - minKitsForLoad -- consume kits for this load
                   table.remove(idleModules, idx)
                   assigned = true
                   break
@@ -500,15 +536,19 @@ local function getSyncColor(t)
 end
 
 local function formatQty(n)
-  if n >= 1000000 then return string.format("%.1fm", n / 1000000)
-  elseif n >= 1000 then return string.format("%.0fk", n / 1000)
-  else return tostring(n) end
+  if n >= 1000000 then
+    return string.format("%.1fm", n / 1000000)
+  elseif n >= 1000 then
+    return string.format("%.0fk", n / 1000)
+  else
+    return tostring(n)
+  end
 end
 
 local function drawModulePanel()
   local row = 6
   local function clear(r) gpu.fill(P1 + 1, r, PW, 1, " ") end
-  for r = 6, H do clear(r) end  -- wipe column first; sections shift between frames
+  for r = 6, H do clear(r) end -- wipe column first; sections shift between frames
   for _, mod in ipairs(modules) do
     if row > H then break end
     clear(row); term.setCursor(P1 + 1, row)
@@ -520,7 +560,8 @@ local function drawModulePanel()
       io.write(string.format("  M%d [%-5s]  LOADING %s", mod.index, mod.tier, mod.job and mod.job.asteroid or ""))
     elseif mod.status == "ERROR" then
       gpu.setForeground(0xFF4444)
-      io.write(string.format("  M%d [%-5s]  ERROR", mod.index, mod.tier))
+      local errMsg = mod.lastError and (" " .. mod.lastError:sub(1, PW - 20)) or ""
+      io.write(string.format("  M%d [%-5s]  ERROR%s", mod.index, mod.tier, errMsg))
     else
       gpu.setForeground(0x555555)
       io.write(string.format("  M%d [%-5s]  IDLE", mod.index, mod.tier))
@@ -538,13 +579,15 @@ local function drawModulePanel()
       -- "loaded 0.4s  db:1 buf:3" — time taken + read-back poll counts.
       if mod.lastLoad and row <= H then
         clear(row); term.setCursor(P1 + 3, row)
-        gpu.setForeground(0x668866)  -- dim green: informational
+        gpu.setForeground(0x668866) -- dim green: informational
         io.write(mod.lastLoad)
         row = row + 1
       end
 
       -- Blank spacer line before the next module, per layout.
-      if row <= H then clear(row); row = row + 1 end
+      if row <= H then
+        clear(row); row = row + 1
+      end
     end
   end
   for r = row, H do gpu.fill(P1 + 1, r, PW, 1, " ") end
@@ -552,13 +595,13 @@ end
 
 local function drawDustPanel()
   local row = 6
-  for r = 6, H do gpu.fill(P2 + 1, r, PW, 1, " ") end  -- wipe column first
+  for r = 6, H do gpu.fill(P2 + 1, r, PW, 1, " ") end -- wipe column first
   local list = {}
   for _, cond in ipairs(config.conditions) do
-    local name  = cond.itemName
-    local stock = (brokerState.dust[name] and brokerState.dust[name].stock) or 0
-    local ratio = stock / cond.amountToMaintain
-    list[#list+1] = { name=name, stock=stock, threshold=cond.amountToMaintain, ratio=ratio }
+    local name    = cond.itemName
+    local stock   = (brokerState.dust[name] and brokerState.dust[name].stock) or 0
+    local ratio   = stock / cond.amountToMaintain
+    list[#list + 1] = { name = name, stock = stock, threshold = cond.amountToMaintain, ratio = ratio }
   end
   table.sort(list, function(a, b) return a.ratio < b.ratio end)
   for _, item in ipairs(list) do
@@ -566,7 +609,7 @@ local function drawDustPanel()
     gpu.fill(P2 + 1, row, PW, 1, " "); term.setCursor(P2 + 1, row)
     local pct = math.floor(item.ratio * 100)
     local color = (item.ratio >= 1.0) and 0x446644 or (item.ratio < 0.25) and 0xFF4444
-                  or (item.ratio < 0.75) and 0xFFAA00 or 0x00FFFF
+        or (item.ratio < 0.75) and 0xFFAA00 or 0x00FFFF
     local mark = item.ratio < 1.0 and "!" or " "
     gpu.setForeground(color)
     io.write(string.format("  %s %-27s %3d%%", mark, item.name, pct))
@@ -785,10 +828,10 @@ end
 -- MAIN LOOP
 -- =============================================================================
 
-runBootPrompt()     -- ask priority mode (runs while you're at the console)
+runBootPrompt()   -- ask priority mode (runs while you're at the console)
 logger:info("Waiting for telemetry...")
-drawStaticFrame()   -- frame appears immediately
-initModules()       -- then clear modules with visible progress
+drawStaticFrame() -- frame appears immediately
+initModules()     -- then clear modules with visible progress
 
 if modem.isOpen(config.ports.telemetry) then
   logger:info("Modem open on port " .. config.ports.telemetry)
@@ -802,7 +845,7 @@ end
 --   - messages: serviced with a tiny event.pull timeout so we spin fast
 --   - UI redraw: ~4x/second (humans don't need more; GPU calls are expensive)
 --   - dispatch: every DISPATCH_INTERVAL
-local UI_INTERVAL = 0.25          -- seconds between full UI repaints
+local UI_INTERVAL = 0.25 -- seconds between full UI repaints
 local lastUIDraw  = 0
 
 while true do
@@ -824,8 +867,8 @@ while true do
   --    run without it). Wait for all three before dispatching.
   if not brokerState.telemetryReady then
     brokerState.telemetryReady = (brokerState.lastDustSyncTime > 0)
-                             and (brokerState.lastHWSyncTime > 0)
-                             and (brokerState.lastFluidSyncTime > 0)
+        and (brokerState.lastHWSyncTime > 0)
+        and (brokerState.lastFluidSyncTime > 0)
   end
 
   -- 5. Dispatch on its own cadence.
