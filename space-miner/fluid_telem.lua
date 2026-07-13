@@ -108,7 +108,7 @@ local function scanPlasmaStock()
     end
     -- Find the highest-tier plasma that has stock (plasmaKeyOrder is descending tier)
     for _, plasmaName in ipairs(config.plasmaKeyOrder) do
-      if volumes[plasmaName] > 0 then
+      if volumes[plasmaName] ~= nil and volumes[plasmaName] > 0 then
         dominantPlasma = plasmaName
         highestVolume  = volumes[plasmaName]
         break
