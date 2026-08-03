@@ -102,6 +102,12 @@ for i, mc in ipairs(nodeConf.modules) do
     doneTime   = nil,
     loadHandle = nil, -- scheduler task handle while LOADING
     loadResult = nil, -- set by the load task: { ok=bool, err=?, stats=? }
+    runStartedAt = nil,
+    lastRunPollAt = 0,
+    inactiveStreak = 0,
+    inactiveSinceAt = nil,
+    nextHeartbeatAt = 0,
+    lastRunWarnAt = 0,
   }
 end
 
@@ -154,6 +160,14 @@ local DISPATCH_INTERVAL = 0.2
 local lastDispatchCheck = 0
 local ERROR_TIMEOUT = 10
 local lastErrorTime = {}
+
+-- RUNNING watchdog tuning (real seconds via computer.uptime).
+-- Require brief startup grace plus repeated inactive polls before DONE.
+local RUN_STARTUP_GRACE = 3.0
+local RUN_POLL_INTERVAL = 0.5
+local RUN_INACTIVE_CONFIRM = 3
+local RUN_HEARTBEAT_INTERVAL = 120
+local RUN_WARN_COOLDOWN = 60
 
 -- =============================================================================
 -- MODULE LIFECYCLE
@@ -228,7 +242,19 @@ local function pollLoad(mod)
       mod.index, tostring(cp.drone), tostring(cp.tip), tostring(cp.rod),
       tostring(s.arrivePolls)))
     mod.status = "RUNNING"
+    mod.runStartedAt = computer.uptime()
+    mod.lastRunPollAt = 0
+    mod.inactiveStreak = 0
+    mod.inactiveSinceAt = nil
+    mod.nextHeartbeatAt = computer.uptime() + RUN_HEARTBEAT_INTERVAL
+    mod.lastRunWarnAt = 0
     mod.job.startTime = os.time()
+    logger:info(string.format(
+      "[HEALTH] M%d started asteroid=%s dist=%s x%s",
+      mod.index,
+      tostring(mod.job and mod.job.asteroid or "?"),
+      tostring(mod.job and mod.job.distance or "?"),
+      tostring(mod.job and mod.job.parallels or "?")))
     -- GTNH 2.9: set all required named parameters before enabling.
     mod.adapter.setParameter("distance", mod.job.distance)
     mod.adapter.setParameter("parallel", mod.job.parallels or 1)
@@ -242,10 +268,70 @@ local function pollLoad(mod)
 end
 
 local function stepRunning(mod)
-  if not mod.adapter.isMachineActive() then
-    mod.status = "DONE"
-    mod.adapter.setWorkAllowed(false)
+  local now = computer.uptime()
+
+  if mod.runStartedAt and (now - mod.runStartedAt) < RUN_STARTUP_GRACE then
+    return
   end
+
+  if (now - (mod.lastRunPollAt or 0)) < RUN_POLL_INTERVAL then
+    return
+  end
+  mod.lastRunPollAt = now
+
+  local ok, isActive = pcall(mod.adapter.isMachineActive)
+  if not ok then
+    mod.inactiveStreak = 0
+    if now - (mod.lastRunWarnAt or 0) >= RUN_WARN_COOLDOWN then
+      logger:warn("[HEALTH] M" .. mod.index .. " status poll failed: " .. tostring(isActive))
+      mod.lastRunWarnAt = now
+    end
+    return
+  end
+
+  if isActive then
+    if mod.inactiveStreak and mod.inactiveStreak > 0 and mod.inactiveSinceAt then
+      local downFor = now - mod.inactiveSinceAt
+      logger:warn(string.format(
+        "[HEALTH] M%d recovered after %.1fs inactive blip (streak=%d)",
+        mod.index, downFor, mod.inactiveStreak))
+    end
+    mod.inactiveStreak = 0
+    mod.inactiveSinceAt = nil
+    if now >= (mod.nextHeartbeatAt or 0) then
+      logger:info(string.format(
+        "[HEALTH] M%d running asteroid=%s for %.0fs",
+        mod.index,
+        tostring(mod.job and mod.job.asteroid or "?"),
+        now - (mod.runStartedAt or now)))
+      mod.nextHeartbeatAt = now + RUN_HEARTBEAT_INTERVAL
+    end
+    return
+  end
+
+  if not mod.inactiveSinceAt then
+    mod.inactiveSinceAt = now
+  end
+  mod.inactiveStreak = (mod.inactiveStreak or 0) + 1
+  if mod.inactiveStreak == 1 or (now - (mod.lastRunWarnAt or 0) >= RUN_WARN_COOLDOWN) then
+    logger:warn(string.format(
+      "[HEALTH] M%d inactive while RUNNING (streak=%d/%d, asteroid=%s)",
+      mod.index,
+      mod.inactiveStreak,
+      RUN_INACTIVE_CONFIRM,
+      tostring(mod.job and mod.job.asteroid or "?")))
+    mod.lastRunWarnAt = now
+  end
+  if mod.inactiveStreak < RUN_INACTIVE_CONFIRM then
+    return
+  end
+
+  logger:warn(string.format(
+    "[HEALTH] M%d marking DONE after %.1fs inactive confirmation",
+    mod.index,
+    now - (mod.inactiveSinceAt or now)))
+  mod.status = "DONE"
+  mod.adapter.setWorkAllowed(false)
 end
 
 local function stepDone(mod)
@@ -261,6 +347,12 @@ local function stepDone(mod)
     mod.job = nil
     mod.status = "IDLE"
     mod.doneTime = nil
+    mod.runStartedAt = nil
+    mod.lastRunPollAt = 0
+    mod.inactiveStreak = 0
+    mod.inactiveSinceAt = nil
+    mod.nextHeartbeatAt = 0
+    mod.lastRunWarnAt = 0
     lastDispatchCheck = os.time() - DISPATCH_INTERVAL
   end
 end
