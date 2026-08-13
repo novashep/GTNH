@@ -234,21 +234,47 @@ function loader.run(mod, job, deps)
   sched.sleep(0.2)
 
   -- 6. Verify the right drone landed in the bus (catches any cross-up).
+  --    Tips/rods can fall a little short if the interface hadn't fully finished
+  --    restocking when we pulled. Rather than hard-failing (which bounces the
+  --    module through a 10s ERROR/idle churn), top the bus back up to the target
+  --    from the interface buffer, which the ME keeps restocked. Only give up if
+  --    it still can't reach the target after a few attempts.
+  local function busCount(busSlot, label)
+    local st = mod.transposer.getStackInSlot(mod.conf.inputBusSide, busSlot)
+    if st and st.label == label then return st.size or 0 end
+    return 0
+  end
+
+  local function topUp(label, target, busSlot)
+    for _ = 1, 5 do
+      local have = busCount(busSlot, label)
+      if have >= target then return true end
+      mod.iface.setInterfaceConfiguration(busSlot, dbAddr,
+        (busSlot == 2) and slotTip or slotRod, target)
+      local src = findSlot(label, 1)
+      if src then
+        mod.transposer.transferItem(
+          mod.conf.interfaceSide, mod.conf.inputBusSide, target - have, src, busSlot)
+      end
+      sched.sleep(0.3)
+    end
+    return busCount(busSlot, label) >= target
+  end
+
   local droneStack = mod.transposer.getStackInSlot(mod.conf.inputBusSide, 1)
-  local tipStack   = mod.transposer.getStackInSlot(mod.conf.inputBusSide, 2)
-  local rodStack   = mod.transposer.getStackInSlot(mod.conf.inputBusSide, 3)
 
   if not droneStack or droneStack.label ~= droneName then
     return false, "drone mismatch in bus: expected " .. droneName ..
         ", got " .. (droneStack and droneStack.label or "empty")
   end
-  if not tipStack or (tipStack.size or 0) < TIPS_PER then
-    return false, "tip shortfall: got " .. (tipStack and tipStack.size or 0)
+  if not topUp(drillEntry.tip, TIPS_PER, 2) then
+    return false, "tip shortfall: got " .. busCount(2, drillEntry.tip)
   end
-  if not rodStack or (rodStack.size or 0) < RODS_PER then
-    return false, "rod shortfall: got " .. (rodStack and rodStack.size or 0)
+  if not topUp(drillEntry.rod, RODS_PER, 3) then
+    return false, "rod shortfall: got " .. busCount(3, drillEntry.rod)
   end
 
+  clearInterfaceSlots(mod)
   return true, stats
 end
 

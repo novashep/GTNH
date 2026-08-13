@@ -91,23 +91,23 @@ local modules = {}
 for i, mc in ipairs(nodeConf.modules) do
   local lbl = "Module " .. i
   modules[i] = {
-    index      = i,
-    tier       = mc.tier,
-    conf       = mc,
-    adapter    = getProxy(mc.moduleAddr, lbl .. " moduleAddr"),
-    iface      = getProxy(mc.ifaceAddr, lbl .. " ifaceAddr"),
-    transposer = getProxy(mc.transposerAddr, lbl .. " transposerAddr"),
-    status     = "IDLE", -- IDLE | LOADING | RUNNING | DONE | ERROR
-    job        = nil,
-    doneTime   = nil,
-    loadHandle = nil, -- scheduler task handle while LOADING
-    loadResult = nil, -- set by the load task: { ok=bool, err=?, stats=? }
-    runStartedAt = nil,
-    lastRunPollAt = 0,
-    inactiveStreak = 0,
+    index           = i,
+    tier            = mc.tier,
+    conf            = mc,
+    adapter         = getProxy(mc.moduleAddr, lbl .. " moduleAddr"),
+    iface           = getProxy(mc.ifaceAddr, lbl .. " ifaceAddr"),
+    transposer      = getProxy(mc.transposerAddr, lbl .. " transposerAddr"),
+    status          = "IDLE", -- IDLE | LOADING | RUNNING | DONE | ERROR
+    job             = nil,
+    doneTime        = nil,
+    loadHandle      = nil, -- scheduler task handle while LOADING
+    loadResult      = nil, -- set by the load task: { ok=bool, err=?, stats=? }
+    runStartedAt    = nil,
+    lastRunPollAt   = 0,
+    inactiveStreak  = 0,
     inactiveSinceAt = nil,
     nextHeartbeatAt = 0,
-    lastRunWarnAt = 0,
+    lastRunWarnAt   = 0,
   }
 end
 
@@ -202,6 +202,11 @@ end
 local function beginLoad(mod)
   mod.loadResult = nil
   mod.loadStart = computer.uptime() -- real seconds, for elapsed readout
+  -- Hard-stop the module before loading. If work is still enabled (e.g. after an
+  -- ERROR auto-recovery), the multiblock will grab the freshly loaded tips/rod/
+  -- drone and start a cycle mid-load, eating a cycle's worth of tips before the
+  -- loader verifies the bus. That produced the false "tip shortfall" errors.
+  pcall(function() mod.adapter.setWorkAllowed(false) end)
   mod.loadHandle = sched.spawn(function()
     local success, ok, errOrStats = xpcall(function()
       return loader.run(mod, mod.job, {
@@ -419,6 +424,7 @@ local function getIdleModules()
       if not lastErrorTime[i] then
         lastErrorTime[i] = now
       elseif now - lastErrorTime[i] >= ERROR_TIMEOUT then
+        pcall(function() mod.adapter.setWorkAllowed(false) end)
         pcall(function() returnItemsToME(mod) end)
         mod.status = "IDLE"; mod.job = nil; mod.doneTime = nil
         lastErrorTime[i] = nil
@@ -542,14 +548,14 @@ local function dispatchBatch()
   for _, need in ipairs(needs) do neededAsteroids[need.asteroid] = need end
 
   -- Working pools we can still hand out this batch: drones and drill kits.
-  local avail    = availableDrones()
-  local availKit = availableKits()
+  local avail          = availableDrones()
+  local availKit       = availableKits()
 
   -- Per-asteroid usage: start from what's already committed, count up as we go,
   -- and never exceed the cap. This is what frees module slots for lower-tier
   -- needs (e.g. Uranium-Plutonium) instead of one asteroid eating them all.
-  local cap      = asteroidCap()
-  local astCount = activeAsteroidCounts()
+  local cap            = asteroidCap()
+  local astCount       = activeAsteroidCounts()
 
   local minKitsForLoad = math.max(config.tipsPerLoad or 64, config.rodsPerLoad or 64)
 
@@ -571,7 +577,7 @@ local function dispatchBatch()
                 local mod = idleModules[idx]
                 if tryDispatch(mod, asteroidName, droneKey) then
                   astCount[asteroidName] = (astCount[asteroidName] or 0) + 1
-                  avail[droneKey]        = avail[droneKey] - 1              -- consume a drone
+                  avail[droneKey]        = avail[droneKey] - 1                 -- consume a drone
                   availKit[drillKey]     = availKit[drillKey] - minKitsForLoad -- consume kits for this load
                   table.remove(idleModules, idx)
                   assigned = true
@@ -690,9 +696,9 @@ local function drawDustPanel()
   for r = 6, H do gpu.fill(P2 + 1, r, PW, 1, " ") end -- wipe column first
   local list = {}
   for _, cond in ipairs(config.conditions) do
-    local name    = cond.itemName
-    local stock   = (brokerState.dust[name] and brokerState.dust[name].stock) or 0
-    local ratio   = stock / cond.amountToMaintain
+    local name      = cond.itemName
+    local stock     = (brokerState.dust[name] and brokerState.dust[name].stock) or 0
+    local ratio     = stock / cond.amountToMaintain
     list[#list + 1] = { name = name, stock = stock, threshold = cond.amountToMaintain, ratio = ratio }
   end
   table.sort(list, function(a, b) return a.ratio < b.ratio end)
