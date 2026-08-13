@@ -104,6 +104,12 @@ config.droneRegistry = {
   luv = { name = "gtnhintergalactic:item.MiningDrone", damage = 5 },
   zpm = { name = "gtnhintergalactic:item.MiningDrone", damage = 6 },
   uv  = { name = "gtnhintergalactic:item.MiningDrone", damage = 7 },
+  uhv = { name = "gtnhintergalactic:item.MiningDrone", damage = 8 },
+  uev = { name = "gtnhintergalactic:item.MiningDrone", damage = 9 },
+  uiv = { name = "gtnhintergalactic:item.MiningDrone", damage = 10 },
+  umv = { name = "gtnhintergalactic:item.MiningDrone", damage = 11 },
+  uxv = { name = "gtnhintergalactic:item.MiningDrone", damage = 12 },
+  max = { name = "gtnhintergalactic:item.MiningDrone", damage = 13 },
 }
 
 config.drillRegistry = {
@@ -123,6 +129,17 @@ config.drillRegistry = {
     tip = { name = "gregtech:gt.metaitem.02", damage = 8324 },
     rod = { name = "gregtech:gt.metaitem.01", damage = 23324 }
   },
+  naquadahAlloy = {
+    tip = { name = "gregtech:gt.metaitem.02", damage = 8325 },
+    rod = { name = "gregtech:gt.metaitem.01", damage = 23325 }
+  },
+  neutronium    = {
+    tip = { name = "gregtech:gt.metaitem.02", damage = 8129 },
+    rod = { name = "gregtech:gt.metaitem.01", damage = 23129 }
+  },
+  -- TODO: scan these with find_item.lua and add them to enable higher drone tiers.
+  -- Until added, dispatch skips any tier that maps to an unregistered drill.
+  --   cosmicNeutronium, infinity, transcendentMetal
 }
 
 -- Maps drone tier number to the drill key in config.drills above.
@@ -721,7 +738,7 @@ config.asteroids = {
     weight = 230
   },
   ["Salt"] = {
-    materials = { "Salt", "RockSalt", "Saltpeter" },
+    materials = { "Salt", "Rock Salt", "Saltpeter" },
     weights = { 4000, 2000, 4000 },
     minSize = 30,
     maxSize = 120,
@@ -1127,41 +1144,52 @@ config.blacklist = {
 -- for the ore processing pipeline to catch up before re-evaluating.
 --------------------------------------------------------------------------------
 config.conditions = {
-  --  { itemName="Ichorium Dust",           amountToMaintain=qty("5k")   },
-  --  { itemName="Draconic Core Dust",      amountToMaintain=qty("5k")   },
-  -- { itemName = "Tengam Dust",           amountToMaintain = qty("2m") }, -- Requires MK-III modules
-  { itemName = "Mysterious Crystal Dust", amountToMaintain = qty("5m") },
-  --  { itemName="Cosmic Neutronium Dust",  amountToMaintain=qty("150m") },
-  { itemName = "Trinium Dust",            amountToMaintain = qty("5m") },
-  --  { itemName="Adamantium Dust",         amountToMaintain=qty("15m")  },
-  { itemName = "Aluminium Dust",          amountToMaintain = qty("5m") },
-  -- { itemName = "Bauxite Dust",          amountToMaintain = qty("50m") },
-  --  { itemName="Crushed Monazite Ore",    amountToMaintain=qty("1m")   },
-  { itemName = "Cobalt Dust",             amountToMaintain = qty("2m") },
-  { itemName = "Ardite Dust",             amountToMaintain = qty("2m") },
-  { itemName = "Lapis Dust",              amountToMaintain = qty("2m") },
-  { itemName = "Chrome Dust",             amountToMaintain = qty("2m") },
-  --  { itemName="Clay Block",              amountToMaintain=qty("0")    },
-  { itemName = "Copper Dust",             amountToMaintain = qty("5m") },
-  --  { itemName="Diamond",                 amountToMaintain=qty("50m")  },
-  --  { itemName="Nether Star",             amountToMaintain=qty("1m")   },
-  --  { itemName="Callisto Ice Dust",       amountToMaintain=qty("25m")  },
-  { itemName = "Europium Dust",           amountToMaintain = qty("5m") },
-  --  { itemName="Gadolinite-Y Dust",       amountToMaintain=qty("15m")  },
-  --  { itemName="Lutetium Dust",           amountToMaintain=qty("10m")  },
-  { itemName = "Naquadah Dust",           amountToMaintain = qty("5m") },
-  { itemName = "Nickel Dust",             amountToMaintain = qty("5m") },
-  { itemName = "Phosphate Dust",          amountToMaintain = qty("5m") },
-  -- { itemName = "Quartz Dust",           amountToMaintain = qty("60m") },
-  -- { itemName = "Salt",                  amountToMaintain = qty("15m") },
-  { itemName = "Raw Silicon Dust",        amountToMaintain = qty("5m") },
-  { itemName = "Infinity Catalyst Dust",  amountToMaintain = qty("5m") },
-  { itemName = "Tungsten Dust",           amountToMaintain = qty("5m") },
-  { itemName = "Uranium 238 Dust",        amountToMaintain = qty("5m") },
-  { itemName = "Saltpeter Dust",          amountToMaintain = qty("5m") },
-  { itemName = "Osmium Dust",             amountToMaintain = qty("5m") },
-  { itemName = "Tiberium Dust",           amountToMaintain = qty("5m") },
-  { itemName = "Titanium Dust",           amountToMaintain = qty("5m") },
+  --  { itemName = "Ichorium Dust",           amountToMaintain = qty("5k")  },
+  --  { itemName = "Draconic Core Dust",      amountToMaintain = qty("2k")  },
+  --  { itemName = "Tengam Dust",             amountToMaintain = qty("2m")  }, -- Requires MK-III modules
+  { itemName = "Mysterious Crystal Dust", amountToMaintain = qty("2m")  },
+  { itemName = "Cosmic Neutronium Dust",  amountToMaintain = qty("5m")  },
+  { itemName = "Trinium Dust",            amountToMaintain = qty("2m")  },
+  { itemName = "Adamantium Dust",         amountToMaintain = qty("2m")  },
+  { itemName = "Aluminium Dust",          amountToMaintain = qty("2m")  },
+  { itemName = "Bauxite Dust",            amountToMaintain = qty("2m")  },
+  --  { itemName = "Crushed Monazite Ore",    amountToMaintain = qty("1m")  },
+  { itemName = "Cobalt Dust",             amountToMaintain = qty("2m")  },
+  { itemName = "Ardite Dust",             amountToMaintain = qty("2m")  },
+  { itemName = "Lapis Dust",              amountToMaintain = qty("2m")  },
+  { itemName = "Chrome Dust",             amountToMaintain = qty("2m")  },
+  --  { itemName = "Clay Block",              amountToMaintain = qty("0")   },
+  { itemName = "Copper Dust",             amountToMaintain = qty("2m")  },
+  { itemName = "Diamond",                 amountToMaintain = qty("10m") },
+  { itemName = "Nether Star",             amountToMaintain = qty("10m") },
+  --  { itemName = "Callisto Ice Dust",       amountToMaintain = qty("2m")  },
+  { itemName = "Europium Dust",           amountToMaintain = qty("2m")  },
+  --  { itemName = "Gadolinite-Y Dust",       amountToMaintain = qty("2m")  },
+  --  { itemName = "Lutetium Dust",           amountToMaintain = qty("2m")  },
+  --  { itemName = "Naquadah Dust",           amountToMaintain = qty("2m")  },
+  { itemName = "Nickel Dust",             amountToMaintain = qty("2m")  },
+  { itemName = "Phosphate Dust",          amountToMaintain = qty("2m")  },
+  { itemName = "Nether Quartz Dust",      amountToMaintain = qty("2m")  },
+  { itemName = "Salt",                    amountToMaintain = qty("2m")  },
+  { itemName = "Raw Silicon Dust",        amountToMaintain = qty("2m")  },
+  { itemName = "Infinity Catalyst Dust",  amountToMaintain = qty("10m") },
+  { itemName = "Tungsten Dust",           amountToMaintain = qty("2m")  },
+  { itemName = "Uranium 238 Dust",        amountToMaintain = qty("2m")  },
+  { itemName = "Saltpeter Dust",          amountToMaintain = qty("2m")  },
+  { itemName = "Osmium Dust",             amountToMaintain = qty("2m")  },
+  { itemName = "Tiberium Dust",           amountToMaintain = qty("2m")  },
+  { itemName = "Mica Dust",               amountToMaintain = qty("2m")  },
+  --  { itemName = "Fluorspar Dust",          amountToMaintain = qty("2m")  },
+  { itemName = "Antimony Dust",           amountToMaintain = qty("5m")  },
+  { itemName = "Gallium Dust",            amountToMaintain = qty("5m")  },
+  { itemName = "Lead Dust",               amountToMaintain = qty("5m")  },
+  { itemName = "Bedrockium Dust",         amountToMaintain = qty("5m")  },
+  { itemName = "Awakened Draconium Dust", amountToMaintain = qty("5m")  },
+  { itemName = "Draconium Dust",          amountToMaintain = qty("5m")  },
+  { itemName = "Neutronium Dust",         amountToMaintain = qty("5m")  },
+  { itemName = "Black Plutonium Dust",    amountToMaintain = qty("5m")  },
+  { itemName = "Rock Salt",               amountToMaintain = qty("5m")  },
+  { itemName = "Rock Salt",               amountToMaintain = qty("5m")  },
 }
 
 --------------------------------------------------------------------------------

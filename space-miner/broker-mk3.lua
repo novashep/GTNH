@@ -170,6 +170,10 @@ local RUN_INACTIVE_CONFIRM = 3
 local RUN_HEARTBEAT_INTERVAL = 120
 local RUN_WARN_COOLDOWN = 60
 
+-- Pinned modules keep their input bus topped up on this interval (real seconds)
+-- so they never run dry and bounce through DONE/reload.
+local PIN_RESTOCK_INTERVAL = 3.0
+
 -- =============================================================================
 -- MODULE LIFECYCLE
 -- =============================================================================
@@ -273,8 +277,77 @@ local function pollLoad(mod)
   end
 end
 
+-- Top a pinned module's input bus back up to full while it runs. Reuses the db
+-- fingerprints written by the initial load (still valid — we never cleared those
+-- slots), so the interface can restock tips/rods by identity. Runs as a task, so
+-- it yields while waiting for items to arrive and never blocks the main loop.
+local function restockPinned(mod)
+  if mod.status ~= "RUNNING" or not mod.job then return end
+  local drill = config.drills[mod.job.drillKey]
+  if not drill then return end
+
+  local TIPS_PER = config.tipsPerLoad or 64
+  local RODS_PER = config.rodsPerLoad or 64
+  local _, slotTip, slotRod = loader.dbSlotsFor(mod.index)
+  local ibufSize = mod.transposer.getInventorySize(mod.conf.interfaceSide) or 9
+
+  local function busCount(busSlot, label)
+    local st = mod.transposer.getStackInSlot(mod.conf.inputBusSide, busSlot)
+    if st and st.label == label then return st.size or 0 end
+    return 0
+  end
+
+  local function findBuf(label)
+    for s = 1, ibufSize do
+      local stack = mod.transposer.getStackInSlot(mod.conf.interfaceSide, s)
+      if stack and stack.label == label then return s, stack.size or 0 end
+    end
+    return nil, 0
+  end
+
+  -- Refill one consumable in the bus back up to `target` from the ME interface.
+  local function refill(label, target, busSlot, dbSlot)
+    if mod.status ~= "RUNNING" then return end
+    local have = busCount(busSlot, label)
+    local deficit = target - have
+    if deficit <= 0 then return end
+    mod.iface.setInterfaceConfiguration(busSlot, dbAddr, dbSlot, target)
+    sched.await(function()
+      local _, n = findBuf(label)
+      return n >= deficit
+    end, 5, 0.2)
+    if mod.status ~= "RUNNING" then
+      mod.iface.setInterfaceConfiguration(busSlot)
+      return
+    end
+    local src = select(1, findBuf(label))
+    if src then
+      mod.transposer.transferItem(mod.conf.interfaceSide, mod.conf.inputBusSide, deficit, src, busSlot)
+    end
+    mod.iface.setInterfaceConfiguration(busSlot) -- stop hoarding the buffer between refills
+  end
+
+  refill(drill.tip, TIPS_PER, 2, slotTip)
+  refill(drill.rod, RODS_PER, 3, slotRod)
+end
+
 local function stepRunning(mod)
   local now = computer.uptime()
+
+  -- Pinned modules: keep the input bus continuously topped up so they never run
+  -- dry (and never cycle through DONE -> return -> IDLE -> reload). We fire a
+  -- short cooperative task on an interval that refills tips/rods from the ME via
+  -- the interface + transposer. The drone (bus slot 1) isn't consumed, so only
+  -- tips (slot 2) and rods (slot 3) are refreshed.
+  if mod.pinnedAsteroid and mod.job then
+    if (not mod.restockHandle or mod.restockHandle.done()) and now >= (mod.nextRestockAt or 0) then
+      mod.nextRestockAt = now + PIN_RESTOCK_INTERVAL
+      mod.restockHandle = sched.spawn(function()
+        local ok, err = pcall(restockPinned, mod)
+        if not ok then logger:warn("[PIN] M" .. mod.index .. " restock error: " .. tostring(err)) end
+      end, "restock-M" .. mod.index)
+    end
+  end
 
   if mod.runStartedAt and (now - mod.runStartedAt) < RUN_STARTUP_GRACE then
     return
@@ -447,6 +520,13 @@ local function tryDispatch(mod, asteroid, droneKey)
 
   local drillKey = config.droneDrillMap[droneTier]
   if not drillKey then return false end
+
+  -- Skip tiers we can't actually load. If the drone or its mapped drill has no
+  -- fingerprint in config.*Registry, the loader would fail with "no droneRegistry
+  -- /drillRegistry for ...". Rejecting here lets dispatch fall back to a lower,
+  -- fully-registered tier instead of bouncing the module through ERROR/idle.
+  if not config.droneRegistry[droneKey] then return false end
+  if not config.drillRegistry[drillKey] then return false end
 
   -- Don't dispatch if we don't have enough drill kits for a full load.
   -- The loader needs config.tipsPerLoad tips + config.rodsPerLoad rods per module.
