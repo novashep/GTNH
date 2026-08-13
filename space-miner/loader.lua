@@ -155,10 +155,11 @@ function loader.run(mod, job, deps)
   mod.iface.setInterfaceConfiguration(2, dbAddr, slotTip, TIPS_PER)
   mod.iface.setInterfaceConfiguration(3, dbAddr, slotRod, RODS_PER)
 
-  -- 4. Wait for all three items to arrive in the interface buffer, identified by
-  --    LABEL anywhere in the buffer (not pinned to a slot position). The
-  --    interface may place items in slots other than 1/2/3, so we search by
-  --    identity. The actual slot is resolved again at transfer time.
+  -- 4. The DRONE is the load gate: wait only for it to arrive in the interface
+  --    buffer. Tips/rods are handled by the patient fill in step 6 instead of
+  --    being required up front. Under heavy ME contention (many modules loading
+  --    at once) tips/rods trickle in slowly, and blocking on the full amount here
+  --    was the cause of the recurring "items did not arrive" errors.
   local ibufSize = mod.transposer.getInventorySize(mod.conf.interfaceSide) or 9
   local function bufferHas(label, minSize)
     for s = 1, ibufSize do
@@ -170,31 +171,18 @@ function loader.run(mod, job, deps)
     return false
   end
 
-  local arrived, polls = pollUntil(function()
+  local droneArrived, polls = pollUntil(function()
     return bufferHas(droneName, 1)
-        and bufferHas(drillEntry.tip, TIPS_PER)
-        and bufferHas(drillEntry.rod, RODS_PER)
   end, ARRIVE_TIMEOUT)
   stats.arrivePolls = polls
-
-  if not arrived then
+  if not droneArrived then
     clearInterfaceSlots(mod)
-    return false, "items did not arrive: drone=" .. tostring(bufferHas(droneName, 1)) ..
-        " tip=" .. tostring(bufferHas(drillEntry.tip, TIPS_PER)) ..
-        " rod=" .. tostring(bufferHas(drillEntry.rod, RODS_PER))
+    return false, "drone did not arrive: " .. droneName
   end
 
-  -- 5. Move items into the input bus by IDENTITY, not by slot position.
-  --    Root cause of the recurring "tip in the drone slot" error: we trusted
-  --    that interface slot 1 held the drone and blindly transferred slot 1 -> bus
-  --    slot 1. But the ME interface actively re-stocks its slots, and can shuffle
-  --    what's in which buffer slot between our check and the transfer. So instead
-  --    of trusting positions, we SCAN the buffer for the slot that actually holds
-  --    each item and move that one. This is correct regardless of how the
-  --    interface reorders slots or whether clearing drains them.
+  -- 5. Move items by IDENTITY, not slot position (the ME interface re-stocks and
+  --    can shuffle which buffer slot holds what between our check and transfer).
   local busSize = mod.transposer.getInventorySize(mod.conf.interfaceSide) or 9
-
-  -- Find the buffer slot whose item matches `label` with at least `minSize`.
   local function findSlot(label, minSize)
     for s = 1, busSize do
       local stack = mod.transposer.getStackInSlot(mod.conf.interfaceSide, s)
@@ -205,73 +193,56 @@ function loader.run(mod, job, deps)
     return nil
   end
 
-  -- Move one matched item from the interface buffer to a specific bus slot.
-  local function moveByIdentity(label, count, busSlot, tag)
-    local src = findSlot(label, count)
-    if not src then
-      return false, tag .. " not found in interface buffer (" .. label .. ")"
-    end
-    local moved = mod.transposer.transferItem(
-      mod.conf.interfaceSide, mod.conf.inputBusSide, count, src, busSlot)
-    if (moved or 0) < count then
-      return false, tag .. " transfer short: moved " .. tostring(moved) .. "/" .. count
-    end
-    return true
+  -- Move the drone (exactly 1) into bus slot 1.
+  local droneSrc = findSlot(droneName, 1)
+  if not droneSrc then
+    clearInterfaceSlots(mod); return false, "drone not found in interface buffer (" .. droneName .. ")"
+  end
+  local movedDrone = mod.transposer.transferItem(
+    mod.conf.interfaceSide, mod.conf.inputBusSide, 1, droneSrc, 1)
+  if (movedDrone or 0) < 1 then
+    clearInterfaceSlots(mod); return false, "drone transfer failed"
   end
 
-  local okMove, moveErr
-  okMove, moveErr = moveByIdentity(droneName, 1, 1, "drone"); if not okMove then
-    clearInterfaceSlots(mod); return false, moveErr
-  end
-  okMove, moveErr = moveByIdentity(drillEntry.tip, TIPS_PER, 2, "tip"); if not okMove then
-    clearInterfaceSlots(mod); return false, moveErr
-  end
-  okMove, moveErr = moveByIdentity(drillEntry.rod, RODS_PER, 3, "rod"); if not okMove then
-    clearInterfaceSlots(mod); return false, moveErr
-  end
-
-  clearInterfaceSlots(mod)
-  sched.sleep(0.2)
-
-  -- 6. Verify the right drone landed in the bus (catches any cross-up).
-  --    Tips/rods can fall a little short if the interface hadn't fully finished
-  --    restocking when we pulled. Rather than hard-failing (which bounces the
-  --    module through a 10s ERROR/idle churn), top the bus back up to the target
-  --    from the interface buffer, which the ME keeps restocked. Only give up if
-  --    it still can't reach the target after a few attempts.
+  -- 6. Fill tips (bus slot 2) and rods (bus slot 3) from the interface buffer,
+  --    which the ME keeps restocked by fingerprint. Patient by design: it
+  --    re-requests and retries so a slow/contended ME still completes instead of
+  --    erroring. The drone (slot 1) isn't consumed and stays put.
   local function busCount(busSlot, label)
     local st = mod.transposer.getStackInSlot(mod.conf.inputBusSide, busSlot)
     if st and st.label == label then return st.size or 0 end
     return 0
   end
 
-  local function topUp(label, target, busSlot)
-    for _ = 1, 5 do
+  local function fill(label, target, busSlot, dbSlot)
+    for _ = 1, 10 do
       local have = busCount(busSlot, label)
-      if have >= target then return true end
-      mod.iface.setInterfaceConfiguration(busSlot, dbAddr,
-        (busSlot == 2) and slotTip or slotRod, target)
+      local deficit = target - have
+      if deficit <= 0 then return true end
+      mod.iface.setInterfaceConfiguration(busSlot, dbAddr, dbSlot, target)
+      sched.await(function() return findSlot(label, 1) ~= nil end, 3, 0.2)
       local src = findSlot(label, 1)
       if src then
         mod.transposer.transferItem(
-          mod.conf.interfaceSide, mod.conf.inputBusSide, target - have, src, busSlot)
+          mod.conf.interfaceSide, mod.conf.inputBusSide, deficit, src, busSlot)
       end
-      sched.sleep(0.3)
+      sched.sleep(0.2)
     end
     return busCount(busSlot, label) >= target
   end
 
+  -- Verify the drone landed correctly before committing tips/rods.
   local droneStack = mod.transposer.getStackInSlot(mod.conf.inputBusSide, 1)
-
   if not droneStack or droneStack.label ~= droneName then
+    clearInterfaceSlots(mod)
     return false, "drone mismatch in bus: expected " .. droneName ..
         ", got " .. (droneStack and droneStack.label or "empty")
   end
-  if not topUp(drillEntry.tip, TIPS_PER, 2) then
-    return false, "tip shortfall: got " .. busCount(2, drillEntry.tip)
+  if not fill(drillEntry.tip, TIPS_PER, 2, slotTip) then
+    clearInterfaceSlots(mod); return false, "tip shortfall: got " .. busCount(2, drillEntry.tip)
   end
-  if not topUp(drillEntry.rod, RODS_PER, 3) then
-    return false, "rod shortfall: got " .. busCount(3, drillEntry.rod)
+  if not fill(drillEntry.rod, RODS_PER, 3, slotRod) then
+    clearInterfaceSlots(mod); return false, "rod shortfall: got " .. busCount(3, drillEntry.rod)
   end
 
   clearInterfaceSlots(mod)

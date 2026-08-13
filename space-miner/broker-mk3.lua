@@ -290,11 +290,21 @@ local function restockPinned(mod)
   local RODS_PER = config.rodsPerLoad or 64
   local _, slotTip, slotRod = loader.dbSlotsFor(mod.index)
   local ibufSize = mod.transposer.getInventorySize(mod.conf.interfaceSide) or 9
+  local busSize = mod.transposer.getInventorySize(mod.conf.inputBusSide) or 16
 
-  local function busCount(busSlot, label)
-    local st = mod.transposer.getStackInSlot(mod.conf.inputBusSide, busSlot)
-    if st and st.label == label then return st.size or 0 end
-    return 0
+  -- Count ALL of `label` across the whole bus, not one fixed slot. If we only
+  -- checked a fixed slot and the item had shifted, we'd read 0 and re-pull a full
+  -- stack every cycle — silently draining the ME and starving other modules.
+  local function busTotal(label)
+    local total, firstSlot = 0, nil
+    for s = 1, busSize do
+      local st = mod.transposer.getStackInSlot(mod.conf.inputBusSide, s)
+      if st and st.label == label then
+        total = total + (st.size or 0)
+        firstSlot = firstSlot or s
+      end
+    end
+    return total, firstSlot
   end
 
   local function findBuf(label)
@@ -306,25 +316,23 @@ local function restockPinned(mod)
   end
 
   -- Refill one consumable in the bus back up to `target` from the ME interface.
-  local function refill(label, target, busSlot, dbSlot)
+  local function refill(label, target, cfgSlot, dbSlot)
     if mod.status ~= "RUNNING" then return end
-    local have = busCount(busSlot, label)
+    local have, slot = busTotal(label)
     local deficit = target - have
     if deficit <= 0 then return end
-    mod.iface.setInterfaceConfiguration(busSlot, dbAddr, dbSlot, target)
-    sched.await(function()
-      local _, n = findBuf(label)
-      return n >= deficit
-    end, 5, 0.2)
+    slot = slot or cfgSlot
+    mod.iface.setInterfaceConfiguration(cfgSlot, dbAddr, dbSlot, target)
+    sched.await(function() return (select(1, findBuf(label))) ~= nil end, 5, 0.2)
     if mod.status ~= "RUNNING" then
-      mod.iface.setInterfaceConfiguration(busSlot)
+      mod.iface.setInterfaceConfiguration(cfgSlot)
       return
     end
     local src = select(1, findBuf(label))
     if src then
-      mod.transposer.transferItem(mod.conf.interfaceSide, mod.conf.inputBusSide, deficit, src, busSlot)
+      mod.transposer.transferItem(mod.conf.interfaceSide, mod.conf.inputBusSide, deficit, src, slot)
     end
-    mod.iface.setInterfaceConfiguration(busSlot) -- stop hoarding the buffer between refills
+    mod.iface.setInterfaceConfiguration(cfgSlot) -- stop hoarding the buffer between refills
   end
 
   refill(drill.tip, TIPS_PER, 2, slotTip)
