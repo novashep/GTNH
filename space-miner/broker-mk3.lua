@@ -93,6 +93,7 @@ for i, mc in ipairs(nodeConf.modules) do
   modules[i] = {
     index           = i,
     tier            = mc.tier,
+    pinnedAsteroid  = mc.pinnedAsteroid, -- if set, this module ONLY mines this asteroid
     conf            = mc,
     adapter         = getProxy(mc.moduleAddr, lbl .. " moduleAddr"),
     iface           = getProxy(mc.ifaceAddr, lbl .. " ifaceAddr"),
@@ -532,6 +533,39 @@ local function hasPlasma()
   return false
 end
 
+-- Dispatch a pinned/reserved module to its fixed asteroid, ignoring dust
+-- thresholds and the per-asteroid cap. Picks the highest-tier available drone
+-- eligible for the asteroid that also has enough drill kits. Returns true if a
+-- job was assigned; false if no suitable drone/kits are free this pass (the
+-- module just stays idle until they are).
+local function tryDispatchPinned(mod, avail, availKit, minKitsForLoad)
+  local asteroid = mod.pinnedAsteroid
+  local asteroidData = config.asteroids[asteroid]
+  if not asteroidData then
+    if not mod.pinWarned then
+      logger:warn("[PIN] M" .. mod.index .. " pinned to unknown asteroid '" .. tostring(asteroid) .. "'")
+      mod.pinWarned = true
+    end
+    return false
+  end
+  for _, droneKey in ipairs(config.droneKeyOrder) do
+    if (avail[droneKey] or 0) > 0 then
+      local droneTier = config.droneTierKeys[droneKey]
+      if droneTier >= asteroidData.minDrone and droneTier <= asteroidData.maxDrone then
+        local drillKey = config.droneDrillMap[droneTier]
+        if drillKey and (availKit[drillKey] or 0) >= minKitsForLoad then
+          if tryDispatch(mod, asteroid, droneKey) then
+            avail[droneKey]    = avail[droneKey] - 1
+            availKit[drillKey] = availKit[drillKey] - minKitsForLoad
+            return true
+          end
+        end
+      end
+    end
+  end
+  return false
+end
+
 local function dispatchBatch()
   pruneStaleJobs()
 
@@ -541,23 +575,37 @@ local function dispatchBatch()
   local idleModules = getIdleModules()
   if #idleModules == 0 then return end
 
+  -- Working pools we can still hand out this batch: drones and drill kits.
+  local avail          = availableDrones()
+  local availKit       = availableKits()
+  local minKitsForLoad = math.max(config.tipsPerLoad or 64, config.rodsPerLoad or 64)
+
+  -- Pinned modules always mine their assigned asteroid, ignoring dust thresholds
+  -- and the per-asteroid cap. Handle them first and drop them from the pool so
+  -- the needs-based loop below can never reassign them elsewhere (a pinned module
+  -- idles rather than mine anything but its target).
+  local pool = {}
+  for _, mod in ipairs(idleModules) do
+    if mod.pinnedAsteroid then
+      tryDispatchPinned(mod, avail, availKit, minKitsForLoad)
+    else
+      pool[#pool + 1] = mod
+    end
+  end
+  if #pool == 0 then return end
+
   local needs = findNeedsList()
   if #needs == 0 then return end
 
   local neededAsteroids = {}
   for _, need in ipairs(needs) do neededAsteroids[need.asteroid] = need end
 
-  -- Working pools we can still hand out this batch: drones and drill kits.
-  local avail          = availableDrones()
-  local availKit       = availableKits()
-
-  -- Per-asteroid usage: start from what's already committed, count up as we go,
-  -- and never exceed the cap. This is what frees module slots for lower-tier
-  -- needs (e.g. Uranium-Plutonium) instead of one asteroid eating them all.
+  -- Per-asteroid usage: start from what's already committed (including pinned
+  -- modules dispatched just above), count up as we go, and never exceed the cap.
+  -- This is what frees module slots for lower-tier needs (e.g. Uranium-Plutonium)
+  -- instead of one asteroid eating them all.
   local cap            = asteroidCap()
   local astCount       = activeAsteroidCounts()
-
-  local minKitsForLoad = math.max(config.tipsPerLoad or 64, config.rodsPerLoad or 64)
 
   for _, droneKey in ipairs(config.droneKeyOrder) do
     if (avail[droneKey] or 0) > 0 then
@@ -573,18 +621,18 @@ local function dispatchBatch()
             -- Eligible if it's a current need AND under its module cap.
             if neededAsteroids[asteroidName] and (astCount[asteroidName] or 0) < cap then
               local assigned = false
-              for idx = #idleModules, 1, -1 do
-                local mod = idleModules[idx]
+              for idx = #pool, 1, -1 do
+                local mod = pool[idx]
                 if tryDispatch(mod, asteroidName, droneKey) then
                   astCount[asteroidName] = (astCount[asteroidName] or 0) + 1
                   avail[droneKey]        = avail[droneKey] - 1                 -- consume a drone
                   availKit[drillKey]     = availKit[drillKey] - minKitsForLoad -- consume kits for this load
-                  table.remove(idleModules, idx)
+                  table.remove(pool, idx)
                   assigned = true
                   break
                 end
               end
-              if assigned and #idleModules == 0 then return end
+              if assigned and #pool == 0 then return end
             end
           end
         end
@@ -650,19 +698,26 @@ local function drawModulePanel()
   for _, mod in ipairs(modules) do
     if row > H then break end
     clear(row); term.setCursor(P1 + 1, row)
+    -- Pinned/reserved modules get a "*" marker so it's clear at a glance which
+    -- ones are locked to a single asteroid. Same width as the normal "  " prefix.
+    local pin = mod.pinnedAsteroid and " *" or "  "
     if mod.status == "RUNNING" then
       gpu.setForeground(0xFFAA00)
-      io.write(string.format("  M%d [%-5s]  %s", mod.index, mod.tier, mod.job and mod.job.asteroid or "?"))
+      io.write(string.format("%sM%d [%-5s]  %s", pin, mod.index, mod.tier, mod.job and mod.job.asteroid or "?"))
     elseif mod.status == "LOADING" then
       gpu.setForeground(0xFFFF00)
-      io.write(string.format("  M%d [%-5s]  LOADING %s", mod.index, mod.tier, mod.job and mod.job.asteroid or ""))
+      io.write(string.format("%sM%d [%-5s]  LOADING %s", pin, mod.index, mod.tier, mod.job and mod.job.asteroid or ""))
     elseif mod.status == "ERROR" then
       gpu.setForeground(0xFF4444)
       local errMsg = mod.lastError and (" " .. mod.lastError:sub(1, PW - 20)) or ""
-      io.write(string.format("  M%d [%-5s]  ERROR%s", mod.index, mod.tier, errMsg))
+      io.write(string.format("%sM%d [%-5s]  ERROR%s", pin, mod.index, mod.tier, errMsg))
     else
       gpu.setForeground(0x555555)
-      io.write(string.format("  M%d [%-5s]  IDLE", mod.index, mod.tier))
+      if mod.pinnedAsteroid then
+        io.write(string.format("%sM%d [%-5s]  IDLE (pin: %s)", pin, mod.index, mod.tier, mod.pinnedAsteroid))
+      else
+        io.write(string.format("%sM%d [%-5s]  IDLE", pin, mod.index, mod.tier))
+      end
     end
     row = row + 1
     if (mod.status == "RUNNING") and mod.job and row <= H then
