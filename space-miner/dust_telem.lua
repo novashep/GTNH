@@ -81,8 +81,9 @@ local function formatQty(n)
 end
 
 local function updateDashboard(sorted)
-  -- Display top 10 most critical items (rows 7-16)
-  for i = 1, 10 do
+  -- Display all items that fit on screen (rows 7 to 24)
+  local maxRows = 18
+  for i = 1, maxRows do
     local row = 6 + i
     term.setCursor(2, row)
     gpu.fill(2, row, 76, 1, " ")

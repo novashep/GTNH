@@ -36,11 +36,11 @@ local nodeName = "MEDINA-HWRelay"
 -- Hardcoded drone and drill lists (don't load config to save memory)
 local droneKeys = {"max","uxv","umv","uiv","uev","uhv","uv","zpm","luv","iv","ev","hv","mv","lv"}
 local droneNames = {
-  max="Mining Drone MK-XIV", uxv="Mining Drone MK-XIII", umv="Mining Drone MK-XII",
-  uiv="Mining Drone MK-XI", uev="Mining Drone MK-X", uhv="Mining Drone MK-IX",
-  uv="Mining Drone MK-VIII", zpm="Mining Drone MK-VII", luv="Mining Drone MK-VI",
-  iv="Mining Drone MK-V", ev="Mining Drone MK-IV", hv="Mining Drone MK-III",
-  mv="Mining Drone MK-II", lv="Mining Drone MK-I"
+  max="Mining Drone MK-XIV (MAX)", uxv="Mining Drone MK-XIII (UXV)", umv="Mining Drone MK-XII (UMV)",
+  uiv="Mining Drone MK-XI (UIV)", uev="Mining Drone MK-X (UEV)", uhv="Mining Drone MK-IX (UHV)",
+  uv="Mining Drone MK-VIII (UV)", zpm="Mining Drone MK-VII (ZPM)", luv="Mining Drone MK-VI (LuV)",
+  iv="Mining Drone MK-V (IV)", ev="Mining Drone MK-IV (EV)", hv="Mining Drone MK-III (HV)",
+  mv="Mining Drone MK-II (MV)", lv="Mining Drone MK-I (LV)"
 }
 
 -- Map drone keys to their voltage tiers

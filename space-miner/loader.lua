@@ -1,5 +1,5 @@
 -- =============================================================================
--- MEDINA LOADER  (v1.5)
+-- MEDINA LOADER  (v2.0 — GTNH 2.9 compatible)
 -- Loads one mining module's consumables (drone + drill tip + drill rod) from the
 -- ME network into its input bus. Designed to run as a scheduler TASK, so six of
 -- these can be in flight at once without freezing the broker.
@@ -10,31 +10,21 @@
 --   - ONE shared database component holds item fingerprints, partitioned by slot:
 --     M1 -> 1/2/3, M2 -> 4/5/6, ...  Slots never overlap between modules.
 --
--- THE KEY INSIGHT (replaces the old magic-sleep guesswork):
---   The database is passive reference storage. iface.store() writes a fingerprint
---   into a slot, but the write may not be visible the instant store() returns.
---   So instead of sleeping a fixed guess and praying, we READ THE SLOT BACK with
---   db.get() and proceed the moment the fingerprint is confirmed. Self-pacing:
---   instant when the server is fast, patient when it lags.
---
--- DIAGNOSTICS:
---   Each load records how many poll iterations the read-back took. If it's almost
---   always 0-1, store() is reliable on this setup. If it's regularly higher,
---   store() returns early and the read-back is what's keeping us correct. Either
---   way the first in-world run tells us the truth.
+-- GTNH 2.9 FIX:
+--   iface.store() is broken in 2.9 — it returns true but writes nothing.
+--   We now use db.set(slot, registryName, damage) which writes fingerprints
+--   directly and synchronously. Registry names come from config.droneRegistry
+--   and config.drillRegistry (populated via scan_items.lua).
 -- =============================================================================
 
-local component = require("component")
-local sched     = dofile("/home/scheduler.lua")
+local component       = require("component")
+local sched           = dofile("/home/scheduler.lua")
 
-local loader = {}
+local loader          = {}
 
 -- Tunables (all in real seconds, all honest — no tick/second mixing).
-local CONFIRM_TIMEOUT = 8     -- max wait for a fingerprint to appear in the db
-local ARRIVE_TIMEOUT  = 8     -- max wait for items to arrive in interface buffer
-local POLL_INTERVAL   = 0.1   -- how often to re-check while awaiting
-local TIPS_PER        = 64    -- drill tips to stock
-local RODS_PER        = 64    -- drill rods to stock
+local ARRIVE_TIMEOUT  = 15  -- max wait for items to arrive in interface buffer
+local POLL_INTERVAL   = 0.2 -- how often to re-check while awaiting
 
 -- Map a module index to its three dedicated database slots.
 local function dbSlotsFor(modIndex)
@@ -55,13 +45,19 @@ local function pollUntil(predicate, timeout)
   return met, iterations
 end
 
--- Confirm a fingerprint actually landed in a db slot by reading it back.
--- This is the spine of the v1.5 fix.
-local function confirmFingerprint(db, slot, expectedLabel)
-  return pollUntil(function()
-    local stack = db.get(slot)
-    return stack ~= nil and stack.label == expectedLabel
-  end, CONFIRM_TIMEOUT)
+-- Write a fingerprint into a db slot using the GTNH 2.9 db.set() API.
+-- Returns true if the fingerprint was written and verified, false + error otherwise.
+local function writeFingerprint(db, slot, regName, regDamage)
+  local ok = db.set(slot, regName, regDamage)
+  if not ok then
+    return false, "db.set returned false for slot " .. slot .. " (" .. regName .. ":" .. regDamage .. ")"
+  end
+  -- Verify it landed (synchronous, but check anyway for safety)
+  local stack = db.get(slot)
+  if not stack then
+    return false, "db.get returned nil after db.set for slot " .. slot
+  end
+  return true
 end
 
 -- Clear the input bus back into the ME interface buffer (recover stale items).
@@ -95,16 +91,23 @@ end
 --   ok=false -> error string
 -- ---------------------------------------------------------------------------
 function loader.run(mod, job, deps)
-  local config = deps.config
-  local logger = deps.logger
-  local db     = deps.db
-  local dbAddr = deps.dbAddr
+  local config     = deps.config
+  local logger     = deps.logger
+  local db         = deps.db
+  local dbAddr     = deps.dbAddr
+
+  local TIPS_PER   = config.tipsPerLoad or 64
+  local RODS_PER   = config.rodsPerLoad or 64
 
   local droneName  = config.drones[job.droneKey]
   local drillEntry = config.drills[job.drillKey]
+  local droneReg   = config.droneRegistry[job.droneKey]
+  local drillReg   = config.drillRegistry[job.drillKey]
 
-  if not droneName  then return false, "bad droneKey: " .. tostring(job.droneKey) end
+  if not droneName then return false, "bad droneKey: " .. tostring(job.droneKey) end
   if not drillEntry then return false, "bad drillKey: " .. tostring(job.drillKey) end
+  if not droneReg then return false, "no droneRegistry for: " .. tostring(job.droneKey) end
+  if not drillReg then return false, "no drillRegistry for: " .. tostring(job.drillKey) end
 
   local slotDrone, slotTip, slotRod = dbSlotsFor(mod.index)
   local stats = { confirmPolls = {}, arrivePolls = 0 }
@@ -133,22 +136,17 @@ function loader.run(mod, job, deps)
     return false, "interface buffer did not drain before load (stale items stuck)"
   end
 
-  -- 2. Write fingerprints, confirming each by read-back before moving on.
+  -- 2. Write fingerprints using db.set (GTNH 2.9 fix — store() is broken).
   local items = {
-    { slot = slotDrone, label = droneName,       tag = "drone" },
-    { slot = slotTip,   label = drillEntry.tip,  tag = "tip"   },
-    { slot = slotRod,   label = drillEntry.rod,  tag = "rod"   },
+    { slot = slotDrone, regName = droneReg.name, regDmg = droneReg.damage, tag = "drone" },
+    { slot = slotTip,   regName = drillReg.tip.name, regDmg = drillReg.tip.damage, tag = "tip" },
+    { slot = slotRod,   regName = drillReg.rod.name, regDmg = drillReg.rod.damage, tag = "rod" },
   }
 
   for _, it in ipairs(items) do
-    local ok = mod.iface.store({ label = it.label }, dbAddr, it.slot)
-    -- store()'s return is treated as a hint; the read-back is the truth.
-    local confirmed, polls = confirmFingerprint(db, it.slot, it.label)
-    stats.confirmPolls[it.tag] = polls
-    if not confirmed then
-      return false, "fingerprint never confirmed for " .. it.tag ..
-                    " (" .. it.label .. ") in slot " .. it.slot ..
-                    "; store() returned " .. tostring(ok)
+    local ok, err = writeFingerprint(db, it.slot, it.regName, it.regDmg)
+    if not ok then
+      return false, "fingerprint write failed for " .. it.tag .. ": " .. err
     end
   end
 
@@ -157,10 +155,11 @@ function loader.run(mod, job, deps)
   mod.iface.setInterfaceConfiguration(2, dbAddr, slotTip, TIPS_PER)
   mod.iface.setInterfaceConfiguration(3, dbAddr, slotRod, RODS_PER)
 
-  -- 4. Wait for all three items to arrive in the interface buffer, identified by
-  --    LABEL anywhere in the buffer (not pinned to a slot position). The
-  --    interface may place items in slots other than 1/2/3, so we search by
-  --    identity. The actual slot is resolved again at transfer time.
+  -- 4. The DRONE is the load gate: wait only for it to arrive in the interface
+  --    buffer. Tips/rods are handled by the patient fill in step 6 instead of
+  --    being required up front. Under heavy ME contention (many modules loading
+  --    at once) tips/rods trickle in slowly, and blocking on the full amount here
+  --    was the cause of the recurring "items did not arrive" errors.
   local ibufSize = mod.transposer.getInventorySize(mod.conf.interfaceSide) or 9
   local function bufferHas(label, minSize)
     for s = 1, ibufSize do
@@ -172,31 +171,18 @@ function loader.run(mod, job, deps)
     return false
   end
 
-  local arrived, polls = pollUntil(function()
+  local droneArrived, polls = pollUntil(function()
     return bufferHas(droneName, 1)
-       and bufferHas(drillEntry.tip, TIPS_PER)
-       and bufferHas(drillEntry.rod, RODS_PER)
   end, ARRIVE_TIMEOUT)
   stats.arrivePolls = polls
-
-  if not arrived then
+  if not droneArrived then
     clearInterfaceSlots(mod)
-    return false, "items did not arrive: drone=" .. tostring(bufferHas(droneName, 1)) ..
-                  " tip=" .. tostring(bufferHas(drillEntry.tip, TIPS_PER)) ..
-                  " rod=" .. tostring(bufferHas(drillEntry.rod, RODS_PER))
+    return false, "drone did not arrive: " .. droneName
   end
 
-  -- 5. Move items into the input bus by IDENTITY, not by slot position.
-  --    Root cause of the recurring "tip in the drone slot" error: we trusted
-  --    that interface slot 1 held the drone and blindly transferred slot 1 -> bus
-  --    slot 1. But the ME interface actively re-stocks its slots, and can shuffle
-  --    what's in which buffer slot between our check and the transfer. So instead
-  --    of trusting positions, we SCAN the buffer for the slot that actually holds
-  --    each item and move that one. This is correct regardless of how the
-  --    interface reorders slots or whether clearing drains them.
+  -- 5. Move items by IDENTITY, not slot position (the ME interface re-stocks and
+  --    can shuffle which buffer slot holds what between our check and transfer).
   local busSize = mod.transposer.getInventorySize(mod.conf.interfaceSide) or 9
-
-  -- Find the buffer slot whose item matches `label` with at least `minSize`.
   local function findSlot(label, minSize)
     for s = 1, busSize do
       local stack = mod.transposer.getStackInSlot(mod.conf.interfaceSide, s)
@@ -207,47 +193,62 @@ function loader.run(mod, job, deps)
     return nil
   end
 
-  -- Move one matched item from the interface buffer to a specific bus slot.
-  local function moveByIdentity(label, count, busSlot, tag)
-    local src = findSlot(label, count)
-    if not src then
-      return false, tag .. " not found in interface buffer (" .. label .. ")"
-    end
-    local moved = mod.transposer.transferItem(
-      mod.conf.interfaceSide, mod.conf.inputBusSide, count, src, busSlot)
-    if (moved or 0) < count then
-      return false, tag .. " transfer short: moved " .. tostring(moved) .. "/" .. count
-    end
-    return true
+  -- Move the drone (exactly 1) into bus slot 1.
+  local droneSrc = findSlot(droneName, 1)
+  if not droneSrc then
+    clearInterfaceSlots(mod); return false, "drone not found in interface buffer (" .. droneName .. ")"
+  end
+  local movedDrone = mod.transposer.transferItem(
+    mod.conf.interfaceSide, mod.conf.inputBusSide, 1, droneSrc, 1)
+  if (movedDrone or 0) < 1 then
+    clearInterfaceSlots(mod); return false, "drone transfer failed"
   end
 
-  local okMove, moveErr
-  okMove, moveErr = moveByIdentity(droneName,      1,        1, "drone"); if not okMove then clearInterfaceSlots(mod); return false, moveErr end
-  okMove, moveErr = moveByIdentity(drillEntry.tip, TIPS_PER, 2, "tip");   if not okMove then clearInterfaceSlots(mod); return false, moveErr end
-  okMove, moveErr = moveByIdentity(drillEntry.rod, RODS_PER, 3, "rod");   if not okMove then clearInterfaceSlots(mod); return false, moveErr end
+  -- 6. Fill tips (bus slot 2) and rods (bus slot 3) from the interface buffer,
+  --    which the ME keeps restocked by fingerprint. Patient by design: it
+  --    re-requests and retries so a slow/contended ME still completes instead of
+  --    erroring. The drone (slot 1) isn't consumed and stays put.
+  local function busCount(busSlot, label)
+    local st = mod.transposer.getStackInSlot(mod.conf.inputBusSide, busSlot)
+    if st and st.label == label then return st.size or 0 end
+    return 0
+  end
+
+  local function fill(label, target, busSlot, dbSlot)
+    for _ = 1, 10 do
+      local have = busCount(busSlot, label)
+      local deficit = target - have
+      if deficit <= 0 then return true end
+      mod.iface.setInterfaceConfiguration(busSlot, dbAddr, dbSlot, target)
+      sched.await(function() return findSlot(label, 1) ~= nil end, 3, 0.2)
+      local src = findSlot(label, 1)
+      if src then
+        mod.transposer.transferItem(
+          mod.conf.interfaceSide, mod.conf.inputBusSide, deficit, src, busSlot)
+      end
+      sched.sleep(0.2)
+    end
+    return busCount(busSlot, label) >= target
+  end
+
+  -- Verify the drone landed correctly before committing tips/rods.
+  local droneStack = mod.transposer.getStackInSlot(mod.conf.inputBusSide, 1)
+  if not droneStack or droneStack.label ~= droneName then
+    clearInterfaceSlots(mod)
+    return false, "drone mismatch in bus: expected " .. droneName ..
+        ", got " .. (droneStack and droneStack.label or "empty")
+  end
+  if not fill(drillEntry.tip, TIPS_PER, 2, slotTip) then
+    clearInterfaceSlots(mod); return false, "tip shortfall: got " .. busCount(2, drillEntry.tip)
+  end
+  if not fill(drillEntry.rod, RODS_PER, 3, slotRod) then
+    clearInterfaceSlots(mod); return false, "rod shortfall: got " .. busCount(3, drillEntry.rod)
+  end
 
   clearInterfaceSlots(mod)
-  sched.sleep(0.2)
-
-  -- 6. Verify the right drone landed in the bus (catches any cross-up).
-  local droneStack = mod.transposer.getStackInSlot(mod.conf.inputBusSide, 1)
-  local tipStack   = mod.transposer.getStackInSlot(mod.conf.inputBusSide, 2)
-  local rodStack   = mod.transposer.getStackInSlot(mod.conf.inputBusSide, 3)
-
-  if not droneStack or droneStack.label ~= droneName then
-    return false, "drone mismatch in bus: expected " .. droneName ..
-                  ", got " .. (droneStack and droneStack.label or "empty")
-  end
-  if not tipStack or (tipStack.size or 0) < TIPS_PER then
-    return false, "tip shortfall: got " .. (tipStack and tipStack.size or 0)
-  end
-  if not rodStack or (rodStack.size or 0) < RODS_PER then
-    return false, "rod shortfall: got " .. (rodStack and rodStack.size or 0)
-  end
-
   return true, stats
 end
 
-loader.dbSlotsFor = dbSlotsFor  -- exported for the broker's UI/return logic
+loader.dbSlotsFor = dbSlotsFor -- exported for the broker's UI/return logic
 
 return loader
